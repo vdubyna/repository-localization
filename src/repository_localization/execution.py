@@ -58,7 +58,10 @@ def _claims(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
         cell = cells.get(claim["cell_id"])
         if cell is None or any(claim.get(key) != value for key, value in expected_identity.items()):
             raise IntegrityError("cell claim has the wrong experiment identity")
-        if any(claim.get(key) != cell[key] for key in ("task_id", "condition", "repeat")):
+        if any(
+            claim.get(key) != cell[key]
+            for key in ("task_id", "condition", "model", "reasoning_effort", "repeat")
+        ):
             raise IntegrityError("cell claim does not match the plan")
         if not _schema_one(claim.get("schema_version")) or claim != {
             "schema_version": 1,
@@ -101,7 +104,10 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
             observation.get(key) != value for key, value in expected_identity.items()
         ):
             raise IntegrityError("observation has the wrong experiment identity")
-        if any(observation.get(key) != cell[key] for key in ("task_id", "condition", "repeat")):
+        if any(
+            observation.get(key) != cell[key]
+            for key in ("task_id", "condition", "model", "reasoning_effort", "repeat")
+        ):
             raise IntegrityError("observation does not match the plan")
         expected_manifest = {
             "schema_version": 1,
@@ -423,13 +429,13 @@ def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -
                 "--cd",
                 str(repository),
                 "--model",
-                runner["model"],
+                cell["model"],
                 "--output-schema",
                 str(schema),
                 "--output-last-message",
                 str(output),
                 "-c",
-                f'model_reasoning_effort="{runner["reasoning_effort"]}"',
+                f'model_reasoning_effort="{cell["reasoning_effort"]}"',
                 "-c",
                 "project_doc_max_bytes=4096",
                 "-c",
@@ -467,7 +473,7 @@ def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -
                     for selected in files:
                         if (
                             selected not in task["source_files"]
-                            or selected == task["documentation"]["entry_path"]
+                            or selected in task["documentation"]["paths"]
                         ):
                             raise IntegrityError("Codex selected an ineligible implementation file")
                         target = repository / selected
@@ -537,7 +543,8 @@ def run(config_path: Path, *, resume: bool) -> tuple[dict[str, str], Path]:
         if cell["cell_id"] in runs:
             continue
         print(
-            f"run {ordinal}/{len(plan['cells'])}: {cell['task_id']} {cell['condition']}",
+            f"run {ordinal}/{len(plan['cells'])}: {cell['task_id']} {cell['condition']} "
+            f"{cell['model']}/{cell['reasoning_effort']}",
             flush=True,
         )
         claim = {"schema_version": 1, **identity(plan), **cell}

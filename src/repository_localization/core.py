@@ -19,11 +19,16 @@ CONDITIONS = (
     "OPTIONAL",
     "DOC-FIRST",
 )
-RUNNER_CONTRACT = "repository-localization-runner-v4"
+RUNNER_CONTRACT = "repository-localization-runner-v5"
 DATASET = {
     "name": "Contextbench/ContextBench",
     "config": "default",
     "split": "train",
+}
+WIKI_TOKENIZER = {
+    "package": "tiktoken",
+    "version": "0.13.0",
+    "encoding": "o200k_base",
 }
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -52,6 +57,15 @@ class ExecutionError(PipelineError):
 
 
 @dataclass(frozen=True, slots=True)
+class Profile:
+    model: str
+    reasoning_effort: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"model": self.model, "reasoning_effort": self.reasoning_effort}
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     path: Path
     raw: bytes
@@ -63,8 +77,7 @@ class Config:
     dataset_revision: str
     repeats: int
     binary: Path
-    model: str
-    reasoning_effort: str
+    profiles: tuple[Profile, ...]
     timeout_seconds: int
 
     @property
@@ -147,6 +160,34 @@ def _integer(value: object, label: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
         raise PipelineError(f"{label} must be an integer from {minimum} to {maximum}")
     return value
+
+
+def _profiles(value: object) -> tuple[Profile, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise PipelineError("runner.profiles must contain from one to eight profiles")
+    profiles: list[Profile] = []
+    seen: set[tuple[str, str]] = set()
+    for number, raw in enumerate(value, 1):
+        profile = _table(
+            raw,
+            f"runner.profiles entry {number}",
+            {"model", "reasoning_effort"},
+        )
+        model = _text(profile["model"], f"runner.profiles entry {number} model")
+        effort = _text(
+            profile["reasoning_effort"],
+            f"runner.profiles entry {number} reasoning_effort",
+        )
+        if effort not in {"low", "medium", "high", "xhigh"}:
+            raise PipelineError(
+                "runner profile reasoning_effort must be low, medium, high, or xhigh"
+            )
+        identity = (model, effort)
+        if identity in seen:
+            raise PipelineError("runner.profiles must contain unique model/reasoning pairs")
+        seen.add(identity)
+        profiles.append(Profile(model, effort))
+    return tuple(profiles)
 
 
 def _table(value: object, label: str, keys: set[str]) -> dict[str, Any]:
@@ -239,11 +280,8 @@ def load_config(path: Path) -> Config:
     runner = _table(
         top["runner"],
         "runner",
-        {"binary", "model", "reasoning_effort", "timeout_seconds"},
+        {"binary", "profiles", "timeout_seconds"},
     )
-    effort = _text(runner["reasoning_effort"], "runner.reasoning_effort")
-    if effort not in {"low", "medium", "high", "xhigh"}:
-        raise PipelineError("runner.reasoning_effort must be low, medium, high, or xhigh")
     base = path.parent
     return Config(
         path=path,
@@ -256,8 +294,7 @@ def load_config(path: Path) -> Config:
         dataset_revision=_git_commit(inputs["dataset_revision"], "inputs.dataset_revision"),
         repeats=_integer(design["repeats"], "design.repeats", 1, 20),
         binary=_absolute(base, runner["binary"], "runner.binary"),
-        model=_text(runner["model"], "runner.model"),
-        reasoning_effort=effort,
+        profiles=_profiles(runner["profiles"]),
         timeout_seconds=_integer(runner["timeout_seconds"], "runner.timeout_seconds", 1, 7200),
     )
 
