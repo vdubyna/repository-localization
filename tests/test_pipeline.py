@@ -186,17 +186,20 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     (fixture / "source").rename(fixture / "source.hidden")
     reported = invoke(config, "report")
     assert reported.returncode == 0, reported.stdout + reported.stderr
-    notebook = json.loads((root / "report" / "report.ipynb").read_text())
-    assert notebook["nbformat"] == 4
-    assert notebook["metadata"]["experiment"] == {**identity, "dataset": plan["dataset"]}
-    report = "".join(notebook["cells"][0]["source"])
-    assert "# Experiment fixture-localization v1" in report
-    assert plan["plan_id"] in report
-    assert "| OPTIONAL | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |" in report
-    assert "| DOC-FIRST | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |" in report
-    assert "../analysis/data.json" in "".join(notebook["cells"][1]["source"])
+    report_data = json.loads((root / "report" / "data.json").read_text())
+    assert {key: report_data[key] for key in identity} == identity
+    assert report_data["dataset"] == plan["dataset"]
+    assert report_data["rows"] == analysis["rows"]
+    assert report_data["aggregates"] == analysis["aggregates"]
+    assert len(report_data["source_checksum"]) == 64
     report_manifest = json.loads((root / "report" / "manifest.json").read_text())
     assert {key: report_manifest[key] for key in identity} == identity
+    shared_eda = json.loads(Path("analysis/eda.ipynb").read_text())
+    notebook_source = "".join(
+        line for cell in shared_eda["cells"] for line in cell.get("source", [])
+    )
+    assert "EDA_CONFIG" in notebook_source
+    assert "build_report" not in notebook_source
 
 
 def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
