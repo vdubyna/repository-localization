@@ -13,9 +13,9 @@ repository-localization report
 
 - `prepare` перевіряє та заморожує всі відкриті входи;
 - `run` запускає Codex у трьох режимах роботи з документацією;
-- `features` виділяє відкриті фічі prompt і перетворює сирі події на таблицю спостережень;
-- `analyze` вперше відкриває gold, додає gold-aware фічу та обчислює метрики;
-- `report` формує стабільний `report/data.json` для спільного EDA notebook.
+- `features` виділяє відкриті фічі prompt і документаційні читання із сирих подій;
+- `analyze` вперше відкриває gold, додає тип задачі, trajectory-ознаки, метрики й дві канонічні CSV;
+- `report` перевіряє похідні артефакти та формує стабільний машинозчитуваний підсумок.
 
 ## Структура коду
 
@@ -163,6 +163,10 @@ cp experiment.example.toml experiment.toml
 продовжити не можна — потрібно вказати нову `experiment_version`.
 
 `runner.binary` має вказувати безпосередньо на executable Codex CLI, а не на shim менеджера версій.
+`runner.profiles` містить до восьми унікальних пар `model`/`reasoning_effort`. Основний контракт у
+`experiment.example.toml` фіксує всі вісім профілів дослідження. Для кожної задачі `prepare` створює
+окрему клітинку для кожної комбінації profile × condition × repeat; модель і reasoning-рівень
+записуються в plan, claim, observation та канонічну таблицю.
 
 ## Формат задач
 
@@ -178,7 +182,10 @@ cp experiment.example.toml experiment.toml
 `AGENTS*.md`.
 
 `documentation_entry` — наявний непорожній файл усередині того самого `source_root`. Його не можна
-вибирати під конкретну задачу або за близькістю до правильної відповіді.
+вибирати під конкретну задачу або за близькістю до правильної відповіді. Під час `prepare` до plan
+записується повний перелік файлів у каталозі цієї стартової сторінки. Для стартової сторінки в корені
+репозиторію документаційним набором вважається лише вона. Саме заморожений перелік, а не розширення
+файла чи назва каталогу, використовується для підрахунку читань.
 
 `gold.jsonl` зберігається окремо від відкритих задач і source roots:
 
@@ -197,10 +204,22 @@ cp experiment.example.toml experiment.toml
 - `prompt_has_filename` — є ім'я файла з підтримуваним source/documentation розширенням;
 - `prompt_has_symbol` — є backtick/call, `snake_case` або `CamelCase` ідентифікатор.
 
-На етапі `analyze` додається `gold_locator_mentioned`. Воно дорівнює `true`, якщо знайдений у
-`prompt` шлях або filename відповідає gold-файлу, або явний symbol відповідає class/function/method,
-визначеному в Python gold-файлі. Ця фіча не потрапляє у `features/data.jsonl`, бо до `analyze`
-правильні файли залишаються закритими. Це описова фіча задачі, а не оцінка її складності.
+На етапі `analyze` ці відкриті сигнали звіряються з gold. `task_type` дорівнює
+`EXPLICIT_LOCATOR_CLUE`, якщо prompt містить точний gold-шлях, ім'я gold-файла або Python-символ,
+визначений у gold-файлі; інакше значення — `NO_EXPLICIT_LOCATOR_CLUE`. До `analyze` ця класифікація
+не зберігається.
+
+Той самий етап додає три ознаки ходу пошуку:
+
+- `gold_seen_any` — gold-шлях з'явився у виводі будь-якої дії з кодом;
+- `gold_seen_by_3_source_actions` — це сталося не пізніше третьої дії з кодом;
+- `gold_targeted_any` — команда безпосередньо звернулася до gold-шляху.
+
+Чотири gold-free ознаки документації обчислюються раніше з `command_execution` events:
+`wiki_read_count`, `wiki_tokens`, `unique_wiki_pages` і `beyond_entry_reads`. Документаційним читанням
+є дія з непорожнім виводом, команда якої однозначно посилається лише на шляхи із замороженого
+документаційного набору. `wiki_tokens` рахується за зафіксованим у plan
+`tiktoken 0.13.0 / o200k_base`.
 
 ## Режими роботи з документацією
 
@@ -254,7 +273,7 @@ uv run repository-localization analyze experiment.toml
 uv run repository-localization report experiment.toml
 ```
 
-`report` не копіює notebook у каталог результатів. Після його виконання відкрийте один спільний
+`report` не копіює notebook у каталог результатів. Після `analyze` відкрийте один спільний
 [`analysis/eda.ipynb`](analysis/eda.ipynb). Notebook читає той самий `experiment.toml` зі змінної
 `EXPERIMENT_CONFIG` або використовує `experiment.toml` у поточному каталозі:
 
@@ -262,9 +281,9 @@ uv run repository-localization report experiment.toml
 EXPERIMENT_CONFIG=experiment.toml jupyter lab analysis/eda.ipynb
 ```
 
-Notebook обчислює шлях до `report/data.json` із `artifact_dir`, `experiment_id` та
-`experiment_version`. Тому конфігурація запуску й джерело EDA завжди описують одну версію
-експерименту.
+Notebook обчислює шляхи до `features/cell_features.csv` і `features/task_features.csv` із
+`artifact_dir`, `experiment_id` та `experiment_version`, а потім перевіряє їхню identity. Окремого
+EDA-конфігу, імпортованого генератора звіту або захардкодженого шляху немає.
 
 ### Рисунки розділу 4
 
@@ -316,7 +335,11 @@ Codex CLI тричі поспіль повідомляє про очікуван
     events.jsonl
     stderr.log
     final-output.json
-  features/{manifest.json,data.jsonl}
+  features/
+    manifest.json
+    data.jsonl
+    cell_features.csv
+    task_features.csv
   analysis/{manifest.json,data.json}
   report/{manifest.json,data.json}
 ```
@@ -324,6 +347,12 @@ Codex CLI тричі поспіль повідомляє про очікуван
 `experiment_id`, `experiment_version` і `plan_id` записані в plan, claims, observations, похідні
 дані та manifests. Сирі Codex events, stderr і final output зберігаються без втрати та прив'язані
 checksums через `observation.json`.
+
+`cell_features.csv` містить один рядок на завершену або terminal клітинку. `task_features.csv`
+спочатку усереднює успішні profile/repeat спостереження в межах task × condition, а потім записує
+парні різниці `doc_first_minus_optional`, `doc_first_minus_no_doc` і `optional_minus_no_doc` для
+якості, ресурсів, читання документації та trajectory-ознак. Незалежною одиницею такого порівняння є
+задача, а не окремий модельний запуск.
 
 ## Перевірка коду
 

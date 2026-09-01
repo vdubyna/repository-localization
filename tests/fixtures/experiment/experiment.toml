@@ -13,6 +13,12 @@ repeats = 1
 
 [runner]
 binary = "/replaced/by/test"
+timeout_seconds = 30
+
+[[runner.profiles]]
 model = "fixture-model"
 reasoning_effort = "low"
-timeout_seconds = 30
+
+[[runner.profiles]]
+model = "fixture-model"
+reasoning_effort = "medium"

@@ -31,12 +31,6 @@ from repository_localization.core import (  # noqa: E402
 )
 
 CONDITIONS = ("NO-DOC", "OPTIONAL", "DOC-FIRST")
-CONDITION_ALIASES = {
-    "NO_DOC_GUIDANCE": "NO-DOC",
-    "FUNCTIONAL_OPTIONAL": "OPTIONAL",
-    "FUNCTIONAL_REQUIRED_BEFORE_SOURCE": "DOC-FIRST",
-    **{condition: condition for condition in CONDITIONS},
-}
 TASK_TYPES = {
     "EXPLICIT_LOCATOR_CLUE": "З файловою підказкою",
     "NO_EXPLICIT_LOCATOR_CLUE": "Без файлової підказки",
@@ -58,13 +52,17 @@ TRAJECTORY = {
     "Агент безпосередньо\nзвернувся до файла": "gold_targeted_any",
 }
 REQUIRED_COLUMNS = {
+    "experiment_id",
+    "experiment_version",
+    "plan_id",
     "cell_id",
-    "safe_task_id",
+    "task_id",
     "task_type",
     "condition",
     "model",
     "reasoning_effort",
     "repeat",
+    "status",
     "provider_total_tokens",
     "elapsed_seconds",
     "agent_step_count",
@@ -173,7 +171,7 @@ def _record(config_path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     )
 
 
-def _cells(payload: bytes) -> list[Cell]:
+def _cells(payload: bytes, identity: dict[str, str]) -> list[Cell]:
     try:
         reader = csv.DictReader(io.StringIO(payload.decode("utf-8"), newline=""))
     except UnicodeDecodeError as exc:
@@ -184,21 +182,24 @@ def _cells(payload: bytes) -> list[Cell]:
     result: list[Cell] = []
     seen: set[str] = set()
     for number, row in enumerate(reader, 2):
+        if any(row.get(key) != value for key, value in identity.items()):
+            raise IntegrityError(f"cell row {number} has the wrong experiment identity")
         cell_id = _text(row.get("cell_id"), f"cell row {number} cell_id")
         if cell_id in seen:
             raise PipelineError(f"duplicate cell_id: {cell_id}")
         seen.add(cell_id)
-        raw_condition = _text(row.get("condition"), f"cell row {number} condition")
-        condition = CONDITION_ALIASES.get(raw_condition)
-        if condition is None:
-            raise PipelineError(f"cell row {number} has unsupported condition: {raw_condition}")
+        condition = _text(row.get("condition"), f"cell row {number} condition")
+        if condition not in CONDITIONS:
+            raise PipelineError(f"cell row {number} has unsupported condition: {condition}")
+        if row.get("status") != "succeeded":
+            raise PipelineError(f"cell row {number} is not a successful observation")
         task_type = _text(row.get("task_type"), f"cell row {number} task_type")
         if task_type not in TASK_TYPES:
             raise PipelineError(f"cell row {number} has unsupported task_type: {task_type}")
         result.append(
             Cell(
                 cell_id=cell_id,
-                task_id=_text(row.get("safe_task_id"), f"cell row {number} safe_task_id"),
+                task_id=_text(row.get("task_id"), f"cell row {number} task_id"),
                 task_type=task_type,
                 condition=condition,
                 model=_text(row.get("model"), f"cell row {number} model"),
@@ -267,7 +268,7 @@ def _input(config_path: Path) -> FigureInput:
     record, root, identity = _record(config_path)
     source = root / "features" / "cell_features.csv"
     payload = _read_file(source, "cell feature table")
-    cells = _cells(payload)
+    cells = _cells(payload, identity)
     _validate_design(record, cells)
     return FigureInput(identity, root, source, digest(payload), cells)
 
