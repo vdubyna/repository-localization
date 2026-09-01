@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -231,6 +232,118 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         line for cell in shared_eda["cells"] for line in cell.get("source", [])
     )
     assert "EXPERIMENT_CONFIG" in notebook_source
+
+
+def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
+    experiment_id = "figure-fixture"
+    experiment_version = "v1"
+    plan_id = "a" * 64
+    artifact_root = tmp_path / "results" / experiment_id / experiment_version
+    feature_root = artifact_root / "features"
+    report_root = artifact_root / "report"
+    feature_root.mkdir(parents=True)
+    report_root.mkdir()
+    config = tmp_path / "experiment-record.toml"
+    config.write_text(
+        "\n".join(
+            (
+                "schema_version = 1",
+                f'experiment_id = "{experiment_id}"',
+                f'experiment_version = "{experiment_version}"',
+                f'source_plan_id = "{plan_id}"',
+                'artifact_dir = "results"',
+                "task_count = 2",
+                "cell_count = 12",
+                "profile_count = 2",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (report_root / "data.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "experiment_id": experiment_id,
+                "experiment_version": experiment_version,
+                "plan_id": plan_id,
+                "rows": [],
+                "aggregates": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fieldnames = [
+        "cell_id",
+        "safe_task_id",
+        "task_type",
+        "condition",
+        "model",
+        "reasoning_effort",
+        "repeat",
+        "recall_at_3",
+        "recall_at_5",
+        "ndcg_at_3",
+        "returned_set_f1",
+        "provider_total_tokens",
+        "elapsed_seconds",
+        "agent_step_count",
+        "gold_seen_any",
+        "gold_seen_by_3_source_actions",
+        "gold_targeted_any",
+    ]
+    conditions = ["NO_DOC_GUIDANCE", "FUNCTIONAL_OPTIONAL", "FUNCTIONAL_REQUIRED_BEFORE_SOURCE"]
+    with (feature_root / "cell_features.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for task_index, task_type in enumerate(
+            ("EXPLICIT_LOCATOR_CLUE", "NO_EXPLICIT_LOCATOR_CLUE")
+        ):
+            for profile_index, (model, effort) in enumerate(
+                (("gpt-5.6-terra", "low"), ("gpt-5.6-sol", "medium"))
+            ):
+                for condition_index, condition in enumerate(conditions):
+                    quality = 0.45 + 0.05 * task_index + 0.02 * condition_index
+                    writer.writerow(
+                        {
+                            "cell_id": f"cell-{task_index}-{profile_index}-{condition_index}",
+                            "safe_task_id": f"task-{task_index}",
+                            "task_type": task_type,
+                            "condition": condition,
+                            "model": model,
+                            "reasoning_effort": effort,
+                            "repeat": 1,
+                            "recall_at_3": quality,
+                            "recall_at_5": quality + 0.02,
+                            "ndcg_at_3": quality + 0.01,
+                            "returned_set_f1": quality - 0.1,
+                            "provider_total_tokens": 1000 + 100 * condition_index,
+                            "elapsed_seconds": 10 + condition_index,
+                            "agent_step_count": 4 + condition_index,
+                            "gold_seen_any": 0.7 + 0.1 * condition_index,
+                            "gold_seen_by_3_source_actions": 0.5 + 0.1 * condition_index,
+                            "gold_targeted_any": 0.6 + 0.1 * condition_index,
+                        }
+                    )
+
+    result = invoke(config, "report", "--figures")
+    assert result.returncode == 0, result.stdout + result.stderr
+    figure_root = report_root / "figures"
+    manifest = json.loads((figure_root / "manifest.json").read_text())
+    assert manifest["experiment_id"] == experiment_id
+    assert manifest["experiment_version"] == experiment_version
+    assert manifest["plan_id"] == plan_id
+    assert manifest["figure_count"] == 8
+    assert manifest["task_count"] == 2
+    assert manifest["cell_count"] == 12
+    assert manifest["profile_count"] == 2
+    assert len(list(figure_root.glob("*.png"))) == 8
+    assert len(list(figure_root.glob("*.pdf"))) == 8
+    assert all(path.read_bytes().startswith(b"\x89PNG") for path in figure_root.glob("*.png"))
+    assert all(path.read_bytes().startswith(b"%PDF") for path in figure_root.glob("*.pdf"))
+    repeated = invoke(config, "report", "--figures")
+    assert repeated.returncode == 0, repeated.stdout + repeated.stderr
 
 
 def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
