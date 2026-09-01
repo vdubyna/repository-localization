@@ -14,8 +14,3 @@ cell_count = 1968
 repository_count = 6
 profile_count = 8
 conditions = ["NO-DOC", "OPTIONAL", "DOC-FIRST"]
-
-[source_condition_labels]
-NO_DOC_GUIDANCE = "NO-DOC"
-FUNCTIONAL_OPTIONAL = "OPTIONAL"
-FUNCTIONAL_REQUIRED_BEFORE_SOURCE = "DOC-FIRST"

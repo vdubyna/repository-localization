@@ -1,5 +1,7 @@
 {
-  "schema_version": "postrun-file-localization-feature-manifest-v1",
+  "schema_version": 1,
+  "experiment_id": "82-tasks",
+  "experiment_version": "2026-09-01-v1",
   "plan_id": "0153a6e87214cac2efcebbf590ae87d366ed9f724598611289e4b308a727189f",
   "provider_accessed": false,
   "model_executed": false,
@@ -9,9 +11,9 @@
   "cell_rows": 1968,
   "task_rows": 82,
   "conditions": [
-    "NO_DOC_GUIDANCE",
-    "FUNCTIONAL_OPTIONAL",
-    "FUNCTIONAL_REQUIRED_BEFORE_SOURCE"
+    "NO-DOC",
+    "OPTIONAL",
+    "DOC-FIRST"
   ],
-  "analysis_unit": "safe_task_id"
+  "analysis_unit": "task_id"
 }
