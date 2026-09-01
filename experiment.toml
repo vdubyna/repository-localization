@@ -1,0 +1,52 @@
+schema_version = 1
+experiment_id = "sympy-10-tasks"
+experiment_version = "2026-09-01-v1"
+artifact_dir = "results"
+
+[inputs]
+tasks = "tasks.jsonl"
+gold = "protected/gold.jsonl"
+dataset_revision = "c2855792b006af41c67202d33883fb9d46362853"
+
+[[repositories]]
+name = "sympy/sympy"
+path = ".local/repositories/sympy.git"
+
+[design]
+repeats = 1
+
+[runner]
+binary = "/Users/vdubyna/.volta/tools/image/packages/@openai/codex/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex"
+timeout_seconds = 900
+
+[[runner.profiles]]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+
+[[runner.profiles]]
+model = "gpt-5.6-luna"
+reasoning_effort = "high"
+
+[[runner.profiles]]
+model = "gpt-5.6-terra"
+reasoning_effort = "low"
+
+[[runner.profiles]]
+model = "gpt-5.6-terra"
+reasoning_effort = "medium"
+
+[[runner.profiles]]
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+
+[[runner.profiles]]
+model = "gpt-5.6-sol"
+reasoning_effort = "low"
+
+[[runner.profiles]]
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+
+[[runner.profiles]]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"

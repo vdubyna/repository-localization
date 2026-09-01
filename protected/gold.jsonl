@@ -1,0 +1,10 @@
+{"task_id":"035b138f25c2c1b022a4d822c98e5564bf75f8727109d18ec3757ce8ec6dfd7a","files":["sympy/printing/str.py"]}
+{"task_id":"04ba06dd6719ec7d254ffc75b12bba3f4566331632d985653c1f8d172bfd4d90","files":["sympy/combinatorics/perm_groups.py"]}
+{"task_id":"1050fe4e32ba39b88e8a1990d6ef4f44288c576e1aba73020eb693c6c2c72197","files":["sympy/sets/conditionset.py","sympy/sets/fancysets.py","sympy/solvers/solveset.py"]}
+{"task_id":"14bb6064c0064e6545e1f9f5f93bbe4effe82449aefff3f97b1984ddcbc6a979","files":["sympy/core/mod.py","sympy/core/tests/test_arit.py"]}
+{"task_id":"2596fd779c8cadcfccfe5a727a23905638fdd6a164599b3f7c06f039e6753f24","files":["sympy/core/_print_helpers.py","sympy/core/basic.py","sympy/core/symbol.py"]}
+{"task_id":"2afc89aff6224cd5c839d363c21634e9017d2aee8b82ff2bb8e6569e63e9162c","files":["sympy/core/numbers.py"]}
+{"task_id":"2f8638e31d0c4bcfec6368fc2f78fc192dd1f3523c4b34e6ab4ec168733b7980","files":["sympy/printing/mathematica.py"]}
+{"task_id":"39a107184ef03a4b09e2f4622b0006fc0a9adffd4796dce8b249fe9acebc6d00","files":["sympy/crypto/crypto.py"]}
+{"task_id":"65f6471ca8c6a918aee0f279a66f354fd00b6b40763b0308f4e534e6e07541aa","files":["sympy/core/mod.py"]}
+{"task_id":"69bf954d4a913e0bf2104803ea5fb7b6afc22f6419501c40e662b72933aa9377","files":["sympy/core/numbers.py"]}
