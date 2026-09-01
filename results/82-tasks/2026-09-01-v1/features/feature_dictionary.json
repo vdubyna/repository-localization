@@ -1,0 +1,68 @@
+{
+  "schema_version": "postrun-file-localization-feature-dictionary-v1",
+  "units": {
+    "cell_features.csv": "one sealed model cell; 1,968 rows",
+    "task_features.csv": "one independent task; eight profiles averaged within condition; 82 rows"
+  },
+  "feature_stages": {
+    "pre_treatment": [
+      "repository",
+      "task_type",
+      "page_type",
+      "entry_page_*",
+      "model",
+      "reasoning_effort"
+    ],
+    "delivered_wiki_exposure": [
+      "wiki_tokens",
+      "wiki_bytes",
+      "wiki_read_count",
+      "unique_wiki_pages",
+      "beyond_entry_reads",
+      "page_1_* through page_5_*",
+      "first_page_share"
+    ],
+    "post_transition_trajectory": [
+      "source_action_count",
+      "unique_targeted_source_files",
+      "non_gold_files_before_gold_or_end",
+      "gold_seen_any",
+      "gold_seen_by_3_source_actions",
+      "gold_targeted_any",
+      "prediction_seen_fraction"
+    ],
+    "outcome": [
+      "recall_at_1",
+      "recall_at_3",
+      "recall_at_5",
+      "hit_at_1",
+      "reciprocal_rank",
+      "ndcg_at_3",
+      "returned_set_precision",
+      "returned_set_f1",
+      "prediction_count"
+    ],
+    "efficiency": [
+      "elapsed_seconds",
+      "agent_step_count",
+      "provider_total_tokens"
+    ]
+  },
+  "important_semantics": {
+    "page_N": "the Nth exact content-bearing documentation-only tool output; one output may contain multiple documentation paths, recorded by page_N_path_count",
+    "wiki_tokens": "sum of measured documentation-only output tokens; mixed or ambiguous outputs are excluded, so this is a conservative exposure measure",
+    "task_aggregation": "profiles are repeated measurements and are averaged before task-level EDA",
+    "causal_boundary": "page structure and task type are pre-treatment descriptors; delivered exposure and trajectory features are descriptive mechanisms, not randomized mediators",
+    "prediction_scoring": "all valid raw ranked-file predictions are scored; adherence labels remain trajectory metadata and do not replace valid predictions with zeros",
+    "agent_step_count": "one NativeToolAccess equals one agent tool-use step; a compound shell command with pipes, conjunctions, semicolons, or multiple subcommands remains one step",
+    "elapsed_seconds": "sealed raw-run wall-clock duration from provider process start to finish"
+  },
+  "deliberately_excluded": [
+    "new model runs",
+    "command-family micro-taxonomy",
+    "fine-grained per-command timing beyond total cell duration",
+    "sequence or embedding models",
+    "cell-level inference that treats profiles as independent tasks",
+    "protected gold paths or raw predictions in exported feature tables"
+  ]
+}

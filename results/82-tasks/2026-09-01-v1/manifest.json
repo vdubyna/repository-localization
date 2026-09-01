@@ -1,0 +1,17 @@
+{
+  "schema_version": "postrun-file-localization-feature-manifest-v1",
+  "plan_id": "0153a6e87214cac2efcebbf590ae87d366ed9f724598611289e4b308a727189f",
+  "provider_accessed": false,
+  "model_executed": false,
+  "sealed_evidence_mutated": false,
+  "protected_gold_accessed_offline": true,
+  "protected_paths_persisted": false,
+  "cell_rows": 1968,
+  "task_rows": 82,
+  "conditions": [
+    "NO_DOC_GUIDANCE",
+    "FUNCTIONAL_OPTIONAL",
+    "FUNCTIONAL_REQUIRED_BEFORE_SOURCE"
+  ],
+  "analysis_unit": "safe_task_id"
+}
