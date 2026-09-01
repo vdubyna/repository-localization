@@ -70,6 +70,55 @@ repository-localization report
    задачі;
 5. записати відкриту частину в `tasks.jsonl`, а правильні шляхи — окремо в захищений `gold.jsonl`.
 
+### Як завантажити й розмістити репозиторій
+
+Git checkout використовується лише як локальний кеш. На вхід експерименту передається чистий
+знімок точного `base_commit` без `.git`. Наприклад, для `sympy/sympy` і commit
+`b4777fdcef467b7132c055f8ac2c9a5059e6a145`:
+
+```bash
+mkdir -p .local/repositories/sympy
+git clone --filter=blob:none --no-checkout \
+  https://github.com/sympy/sympy.git \
+  .local/repositories/sympy/sympy
+
+git -C .local/repositories/sympy/sympy fetch --depth=1 origin \
+  b4777fdcef467b7132c055f8ac2c9a5059e6a145
+git -C .local/repositories/sympy/sympy rev-parse \
+  'b4777fdcef467b7132c055f8ac2c9a5059e6a145^{commit}'
+
+mkdir -p sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145
+git -C .local/repositories/sympy/sympy archive \
+  b4777fdcef467b7132c055f8ac2c9a5059e6a145 \
+  | tar -xf - -C sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145
+```
+
+`rev-parse` має надрукувати той самий повний 40-символьний commit. Після експорту рядок задачі
+посилається саме на каталог знімка:
+
+```json
+{"task_id":"<stable-task-id>","repository":"sympy/sympy","base_commit":"b4777fdcef467b7132c055f8ac2c9a5059e6a145","prompt":"<task text>","source_root":"sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145","documentation_entry":"doc/src/index.rst"}
+```
+
+`source_root` обчислюється від каталогу, де лежить `experiment.toml`. `documentation_entry`
+обчислюється від `source_root`, тому тут файл має існувати як
+`sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145/doc/src/index.rst`.
+Перевірте знімок до `prepare`:
+
+```bash
+test ! -d sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145/.git
+test -s sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145/doc/src/index.rst
+find sources/sympy/sympy/b4777fdcef467b7132c055f8ac2c9a5059e6a145 -type l -print
+```
+
+Остання команда не повинна нічого вивести. `prepare` додатково відхиляє жорсткі посилання,
+службові каталоги `.git`, `.codex`, `.agents`, `.experiment` і наявні `AGENTS*.md`. Якщо точний
+commit містить такі файли, його не можна мовчки змінювати: виключіть задачу до формування вибірки
+або заздалегідь визначте й задокументуйте єдине правило матеріалізації для всіх задач.
+
+Для іншого commit того самого репозиторію повторіть `fetch`, `rev-parse` й `archive`; повторний
+`clone` не потрібен.
+
 Один знімок `repository + base_commit` можна використовувати для кількох задач. Пайплайн не доводить
 відповідність експортованих байтів Git commit без `.git`; це обов'язок зовнішньої підготовки. Під час
 `prepare` він фіксує одночасно заявлений `base_commit` і контрольну суму всіх фактичних байтів
@@ -120,7 +169,7 @@ cp experiment.example.toml experiment.toml
 `tasks.jsonl` містить по одному відкритому рядку на задачу:
 
 ```json
-{"task_id":"SWE-Bench-Verified__python__maintenance__bugfix__example","repository":"django/django","base_commit":"0123456789abcdef0123456789abcdef01234567","prompt":"Locate the files relevant to this issue.","source_root":"sources/django/0123456789abcdef0123456789abcdef01234567","documentation_entry":"docs/index.txt"}
+{"task_id":"SWE-Bench-Verified__python__maintenance__bugfix__example","repository":"django/django","base_commit":"0123456789abcdef0123456789abcdef01234567","prompt":"Locate the files relevant to this issue.","source_root":"sources/django/django/0123456789abcdef0123456789abcdef01234567","documentation_entry":"docs/index.txt"}
 ```
 
 `base_commit` повинен бути повним 40-символьним Git SHA нижнього регістру. `source_root` може бути
