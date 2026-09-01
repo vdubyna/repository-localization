@@ -10,6 +10,7 @@ from repository_localization.pipeline import (
     PipelineError,
     analyze,
     features,
+    figures,
     prepare,
     report,
     run,
@@ -33,9 +34,16 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run untouched cells only; claimed or terminal cells are never retried.",
     )
-    for name in ("features", "analyze", "report"):
+    for name in ("features", "analyze"):
         command = commands.add_parser(name)
         command.add_argument("config", nargs="?", type=Path, default=Path("experiment.toml"))
+    report_command = commands.add_parser("report")
+    report_command.add_argument("config", nargs="?", type=Path, default=Path("experiment.toml"))
+    report_command.add_argument(
+        "--figures",
+        action="store_true",
+        help="Generate the eight Chapter 4 figures from persisted cell features.",
+    )
     return root
 
 
@@ -50,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if arguments.command == "run":
             experiment, artifact = run(arguments.config, resume=arguments.resume)
+        elif arguments.command == "report" and arguments.figures:
+            experiment, artifact = figures(arguments.config)
         else:
             experiment, artifact = operations[arguments.command](arguments.config)
     except PipelineError as exc:
