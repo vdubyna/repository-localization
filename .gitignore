@@ -6,6 +6,7 @@
 
 # Local experiment state. Keep it out of the software release by default.
 /experiment.toml
+/eda.toml
 /tasks.jsonl
 /protected/
 /sources/
