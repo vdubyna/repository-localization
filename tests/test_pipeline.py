@@ -230,7 +230,7 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     notebook_source = "".join(
         line for cell in shared_eda["cells"] for line in cell.get("source", [])
     )
-    assert "EDA_CONFIG" in notebook_source
+    assert "EXPERIMENT_CONFIG" in notebook_source
 
 
 def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
