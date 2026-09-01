@@ -126,6 +126,9 @@ Codex executable має бути прямим native executable, а не shim м
 Для кожної пари `task × condition` створюється один read-only workspace і повторно використовується
 профілями. Кожна клітинка має окремий тимчасовий `HOME`, `CODEX_HOME`, output schema та ephemeral
 Codex session, тому задачі й профілі не ділять стан агента.
+`run` примусово задає Codex CLI `web_search = "disabled"`; read-only sandbox блокує мережу для
+shell-команд, а raw events додатково перевіряються на web search і MCP. Виявлення зовнішнього
+інструмента одразу зупиняє запуск, щоб клітинки залишалися локальними й порівнюваними.
 
 ## Git-процес і запуск
 

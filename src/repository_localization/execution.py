@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import resource
 import shutil
@@ -283,6 +284,21 @@ def _validate_events(events: bytes) -> None:
         raise IntegrityError("Codex lifecycle is incomplete")
 
 
+def _forbidden_tool(events: bytes) -> str | None:
+    """Return the first external tool recorded by the native Codex event stream."""
+    for line in events.splitlines():
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(value, dict) or value.get("type") != "item.completed":
+            continue
+        item = value.get("item")
+        if isinstance(item, dict) and item.get("type") in {"web_search", "mcp_tool_call"}:
+            return str(item["type"])
+    return None
+
+
 def _usage(events: bytes) -> dict[str, int | None]:
     usage: dict[str, int | None] = {
         "input_tokens": None,
@@ -348,7 +364,8 @@ def _prompt(task: dict[str, Any]) -> str:
     return (
         "Locate the repository files relevant to the task. Work read-only. Return JSON with one "
         "to five unique repository-relative source file paths under the key files, ordered from "
-        "most to least likely. Do not pad the list.\n\n"
+        "most to least likely. Do not pad the list. Use only the local repository: do not use "
+        "web search, network access, or external tools.\n\n"
         f"Task:\n{task['prompt']}\n"
     )
 
@@ -444,6 +461,8 @@ def _execute(
                 "-c",
                 f'model_reasoning_effort="{cell["reasoning_effort"]}"',
                 "-c",
+                'web_search="disabled"',
+                "-c",
                 "project_doc_max_bytes=4096",
                 "-c",
                 "project_doc_fallback_filenames=[]",
@@ -463,7 +482,10 @@ def _execute(
                     final_output = output.read_bytes()
                 else:
                     terminal_reason = "invalid_output_file"
-            if timed_out:
+            forbidden_tool = _forbidden_tool(events)
+            if forbidden_tool is not None:
+                terminal_reason = "forbidden_tool"
+            elif timed_out:
                 terminal_reason = "timeout"
             elif network_unavailable:
                 terminal_reason = "network_unavailable"
@@ -578,10 +600,13 @@ def run(config_path: Path, *, resume: bool) -> tuple[dict[str, str], Path]:
                 },
             )
             runs[cell["cell_id"]] = evidence.observation
-            if evidence.observation.get("terminal_reason") == "condition_violation":
+            reason = evidence.observation.get("terminal_reason")
+            if reason == "condition_violation":
                 raise ExecutionError(
                     f"{cell['cell_id']}: DOC-FIRST did not read the configured entry first"
                 )
+            if reason == "forbidden_tool":
+                raise ExecutionError(f"{cell['cell_id']}: Codex used a forbidden external tool")
     terminals = [
         f"{cell['cell_id']}:{runs[cell['cell_id']]['terminal_reason']}"
         for cell in plan["cells"]
