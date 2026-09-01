@@ -1,1 +1,1 @@
-{"task_id":"ContextBench__fixture-task","repository":"example/repository","base_commit":"0123456789abcdef0123456789abcdef01234567","prompt":"Locate `pkg/service.py` and the `greeting` function.","source_root":"source","documentation_entry":"docs/index.md"}
+{"task_id":"ContextBench__fixture-task","repository":"example/repository","base_commit":"0123456789abcdef0123456789abcdef01234567","prompt":"Locate `pkg/service.py` and the `greeting` function.","documentation_entry":"docs/index.md"}

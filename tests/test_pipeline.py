@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-import hashlib
+import io
 import json
 import os
 import shutil
@@ -10,7 +10,8 @@ import sys
 import time
 from pathlib import Path
 
-from repository_localization.analysis import _gold_locator_mentioned, _prompt_features
+from repository_localization.analysis import _has_explicit_gold_locator, _prompt_features
+from repository_localization.execution import _doc_first_valid, _forbidden_tool
 
 FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 
@@ -18,8 +19,13 @@ FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 def fake_codex(path: Path, *, exit_code: int = 0, network_failure: bool = False) -> Path:
     path.write_text(
         f"""#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'fake-codex 1.0'
+  exit 0
+fi
 output=""
 schema=""
+search_disabled=0
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output-last-message" ]; then
     shift
@@ -27,9 +33,14 @@ while [ "$#" -gt 0 ]; do
   elif [ "$1" = "--output-schema" ]; then
     shift
     schema="$1"
+  elif [ "$1" = 'web_search="disabled"' ]; then
+    search_disabled=1
   fi
   shift
 done
+if [ "$search_disabled" -ne 1 ]; then
+  exit 11
+fi
 if [ {exit_code} -ne 0 ]; then
   exit {exit_code}
 fi
@@ -49,8 +60,28 @@ if [ ! -x pkg/service.py ]; then
 fi
 if [ -f AGENTS.md ]; then
   files='["pkg/service.py"]'
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"cat docs/index.md",'\
+'"aggregated_output":"documentation\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"cat docs/guide.md",'\
+'"aggregated_output":"service guide\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"rg greeting pkg",'\
+'"aggregated_output":"pkg/service.py:1:def greeting():\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"pkg/service.py",'\
+'"aggregated_output":"def greeting():\\n"}}}}'
+  printf '%s\n' "$event"
 else
   files='["pkg/readme.py"]'
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"pkg/readme.py",'\
+'"aggregated_output":"pkg/readme.py\\n"}}}}'
+  printf '%s\n' "$event"
 fi
 printf '{{"files":%s}}\n' "$files" > "$output"
 printf '%s\n' '{{"type":"thread.started"}}'
@@ -68,6 +99,32 @@ def setup(
     fixture = tmp_path / "experiment"
     shutil.copytree(FIXTURE, fixture)
     (fixture / "source" / "pkg" / "service.py").chmod(0o755)
+    subprocess.run(["git", "init", "-q", fixture / "source"], check=True)
+    subprocess.run(["git", "-C", fixture / "source", "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            fixture / "source",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", fixture / "source", "rev-parse", "HEAD"],
+        capture_output=True,
+        check=True,
+        text=True,
+    ).stdout.strip()
+    tasks = fixture / "tasks.jsonl"
+    tasks.write_text(tasks.read_text().replace("0123456789abcdef0123456789abcdef01234567", commit))
     (fixture / "source").chmod(0o555)
     binary = fake_codex(
         tmp_path / "fake-codex", exit_code=exit_code, network_failure=network_failure
@@ -104,8 +161,102 @@ def test_task_locator_features_are_explicit_and_gold_aware(tmp_path: Path) -> No
     source = tmp_path / "pkg"
     source.mkdir()
     (source / "service.py").write_text("def greeting():\n    return 'hello'\n")
-    assert _gold_locator_mentioned("Fix `greeting`.", ["pkg/service.py"], tmp_path)
-    assert not _gold_locator_mentioned("Fix unrelated behavior.", ["pkg/service.py"], tmp_path)
+
+    def read_source(path: str) -> bytes:
+        return (tmp_path / path).read_bytes()
+
+    assert _has_explicit_gold_locator("Fix `greeting`.", ["pkg/service.py"], read_source)
+    assert not _has_explicit_gold_locator(
+        "Fix unrelated behavior.", ["pkg/service.py"], read_source
+    )
+
+
+def test_doc_first_requires_the_documentation_read_as_the_first_tool_call() -> None:
+    documentation = (
+        b'{"type":"item.completed","item":{"type":"command_execution",'
+        b'"command":"cat docs/index.md","aggregated_output":"documentation\\n"}}\n'
+    )
+    navigation = (
+        b'{"type":"item.completed","item":{"type":"command_execution",'
+        b'"command":"pwd","aggregated_output":"/repository\\n"}}\n'
+    )
+    assert _doc_first_valid(documentation, "docs/index.md")
+    assert not _doc_first_valid(navigation + documentation, "docs/index.md")
+
+
+def test_external_tools_are_rejected_even_with_duplicate_native_ids() -> None:
+    web_search = (
+        b'{"type":"item.completed","item":{"id":"item-1","type":"web_search",'
+        b'"id":"exec-1","query":"upstream issue"}}\n'
+    )
+    mcp = b'{"type":"item.completed","item":{"type":"mcp_tool_call"}}\n'
+    command = b'{"type":"item.completed","item":{"type":"command_execution"}}\n'
+
+    assert _forbidden_tool(web_search) == "web_search"
+    assert _forbidden_tool(mcp) == "mcp_tool_call"
+    assert _forbidden_tool(command) is None
+
+
+def test_figure_input_keeps_terminal_count_and_uses_successful_rows() -> None:
+    from repository_localization.figures import REQUIRED_COLUMNS, _cells
+
+    identity = {"experiment_id": "fixture", "experiment_version": "v1"}
+    rows = []
+    for cell_id, status in (("cell-000001", "succeeded"), ("cell-000002", "terminal")):
+        row = {column: "1" for column in REQUIRED_COLUMNS}
+        row.update(
+            {
+                **identity,
+                "cell_id": cell_id,
+                "task_id": "task-1",
+                "task_type": "EXPLICIT_LOCATOR_CLUE",
+                "condition": "NO-DOC",
+                "model": "fixture-model",
+                "reasoning_effort": "low",
+                "repeat": "1",
+                "status": status,
+            }
+        )
+        rows.append(row)
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=sorted(REQUIRED_COLUMNS), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+
+    cells, total, terminals = _cells(stream.getvalue().encode(), identity)
+
+    assert [cell.cell_id for cell in cells] == ["cell-000001"]
+    assert total == 2
+    assert terminals == 1
+
+
+def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
+    fixture, config = setup(tmp_path)
+    profiles = "".join(
+        f'\n[[runner.profiles]]\nmodel = "fixture-{number}"\nreasoning_effort = "high"\n'
+        for number in range(3, 9)
+    )
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("parallelism = 1", "parallelism = 8") + profiles,
+        encoding="utf-8",
+    )
+
+    prepared = invoke(config, "prepare")
+
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    plan = json.loads(
+        (fixture / "artifacts" / "fixture-localization" / "v1" / "plan.json").read_text()
+    )
+    assert len(plan["runner"]["profiles"]) == 8
+    assert plan["runner"]["parallelism"] == 8
+    assert len(plan["cells"]) == 24
+    executed = invoke(config, "run")
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    output_lines = executed.stdout.splitlines()
+    first_done = next(number for number, line in enumerate(output_lines) if "run done" in line)
+    assert sum("run start" in line for line in output_lines[:first_done]) == 8
+    root = fixture / "artifacts" / "fixture-localization" / "v1"
+    assert len(list((root / "runs").glob("*/observation.json"))) == 24
 
 
 def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None:
@@ -127,19 +278,11 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     observation["input_tokens"] = 999
     first_observation.chmod(0o600)
     first_observation.write_text(json.dumps(observation, sort_keys=True) + "\n")
-    run_manifest = first_observation.parent / "manifest.json"
-    manifest_payload = run_manifest.read_bytes()
-    manifest = json.loads(manifest_payload)
-    manifest["observation_checksum"] = hashlib.sha256(first_observation.read_bytes()).hexdigest()
-    run_manifest.chmod(0o600)
-    run_manifest.write_text(json.dumps(manifest, sort_keys=True) + "\n")
     invalid_features = invoke(config, "features")
     assert invalid_features.returncode == 4
     assert "usage differs" in invalid_features.stdout
     first_observation.write_bytes(observation_payload)
     first_observation.chmod(0o444)
-    run_manifest.write_bytes(manifest_payload)
-    run_manifest.chmod(0o444)
 
     featured = invoke(config, "features")
     assert featured.returncode == 0, featured.stdout + featured.stderr
@@ -149,7 +292,7 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     assert all(row["prompt_has_path"] for row in feature_rows)
     assert all(row["prompt_has_filename"] for row in feature_rows)
     assert all(row["prompt_has_symbol"] for row in feature_rows)
-    assert all("gold_locator_mentioned" not in row for row in feature_rows)
+    assert all("task_type" not in row for row in feature_rows)
 
     hidden_gold.rename(gold)
 
@@ -165,7 +308,6 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     identity = {
         "experiment_id": "fixture-localization",
         "experiment_version": "v1",
-        "plan_id": plan["plan_id"],
     }
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     assert {key: analysis[key] for key in identity} == identity
@@ -181,25 +323,41 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         "revision": "c2855792b006af41c67202d33883fb9d46362853",
     }
     assert plan["tasks"][0]["guidance"]["NO-DOC"] is None
-    assert plan["tasks"][0]["base_commit"] == "0123456789abcdef0123456789abcdef01234567"
+    assert plan["tasks"][0]["documentation"]["paths"] == ["docs/guide.md", "docs/index.md"]
+    assert (
+        plan["tasks"][0]["base_commit"]
+        == json.loads((fixture / "tasks.jsonl").read_text())["base_commit"]
+    )
+    assert plan["runner"]["profiles"] == [
+        {"model": "fixture-model", "reasoning_effort": "low"},
+        {"model": "fixture-model", "reasoning_effort": "medium"},
+    ]
     assert "You may consult" in plan["tasks"][0]["guidance"]["OPTIONAL"]
-    assert "Before searching" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
+    assert "first tool call" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
     assert [row["mean_recall_at_5"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_recall_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_ndcg_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_returned_set_f1"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
-    assert [row["successful_observations"] for row in analysis["aggregates"]] == [1, 1, 1]
+    assert [row["successful_observations"] for row in analysis["aggregates"]] == [2, 2, 2]
     assert [row["terminal_observations"] for row in analysis["aggregates"]] == [0, 0, 0]
-    assert all(row["prompt_has_path"] for row in analysis["rows"])
-    assert all(row["prompt_has_filename"] for row in analysis["rows"])
-    assert all(row["prompt_has_symbol"] for row in analysis["rows"])
-    assert all(row["gold_locator_mentioned"] for row in analysis["rows"])
+    assert all(row["task_type"] == "EXPLICIT_LOCATOR_CLUE" for row in analysis["rows"])
+    assert [row["wiki_read_count"] for row in analysis["rows"]] == [0, 2, 2, 0, 2, 2]
+    assert [row["unique_wiki_pages"] for row in analysis["rows"]] == [0, 2, 2, 0, 2, 2]
+    assert [row["beyond_entry_reads"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert all(row["wiki_tokens"] > 0 for row in analysis["rows"] if row["condition"] != "NO-DOC")
+    assert [row["gold_seen_any"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert [row["gold_seen_by_3_source_actions"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert [row["gold_targeted_any"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    with (root / "features" / "cell_features.csv").open(newline="") as handle:
+        cell_rows = list(csv.DictReader(handle))
+    with (root / "features" / "task_features.csv").open(newline="") as handle:
+        task_rows = list(csv.DictReader(handle))
+    assert len(cell_rows) == 6
+    assert len(task_rows) == 1
+    assert task_rows[0]["doc_first_minus_optional_recall_at_3"] == "0.0"
     json_artifacts = [
         *sorted((root / "claims").glob("*.json")),
-        *sorted((root / "runs").glob("*/manifest.json")),
         *sorted((root / "runs").glob("*/observation.json")),
-        root / "features" / "manifest.json",
-        root / "analysis" / "manifest.json",
     ]
     for path in json_artifacts:
         payload = json.loads(path.read_text())
@@ -210,34 +368,40 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     for row in analysis["rows"]:
         assert {key: row[key] for key in identity} == identity
     for run_root in (root / "runs").iterdir():
-        observation = json.loads((run_root / "observation.json").read_text())
-        for name, checksum in observation["checksums"].items():
-            assert hashlib.sha256((run_root / name).read_bytes()).hexdigest() == checksum
+        assert {path.name for path in run_root.iterdir()} == {
+            "observation.json",
+            "events.jsonl",
+            "stderr.log",
+            "final-output.json",
+        }
 
     gold.rename(hidden_gold)
     (fixture / "tasks.jsonl").rename(fixture / "tasks.hidden")
     (fixture / "source").rename(fixture / "source.hidden")
     reported = invoke(config, "report")
     assert reported.returncode == 0, reported.stdout + reported.stderr
+    (root / "report" / "figures").mkdir()
+    repeated_report = invoke(config, "report")
+    assert repeated_report.returncode == 0, repeated_report.stdout + repeated_report.stderr
     report_data = json.loads((root / "report" / "data.json").read_text())
     assert {key: report_data[key] for key in identity} == identity
     assert report_data["dataset"] == plan["dataset"]
     assert report_data["rows"] == analysis["rows"]
     assert report_data["aggregates"] == analysis["aggregates"]
-    assert len(report_data["source_checksum"]) == 64
-    report_manifest = json.loads((root / "report" / "manifest.json").read_text())
-    assert {key: report_manifest[key] for key in identity} == identity
     shared_eda = json.loads(Path("analysis/eda.ipynb").read_text())
     notebook_source = "".join(
         line for cell in shared_eda["cells"] for line in cell.get("source", [])
     )
     assert "EXPERIMENT_CONFIG" in notebook_source
+    assert "features/cell_features.csv" in notebook_source
+    assert "features/task_features.csv" in notebook_source
+    assert "report/data.json" not in notebook_source
+    assert "build_focused_research_report" not in notebook_source
 
 
 def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
     experiment_id = "figure-fixture"
     experiment_version = "v1"
-    plan_id = "a" * 64
     artifact_root = tmp_path / "results" / experiment_id / experiment_version
     feature_root = artifact_root / "features"
     report_root = artifact_root / "report"
@@ -250,7 +414,6 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
                 "schema_version = 1",
                 f'experiment_id = "{experiment_id}"',
                 f'experiment_version = "{experiment_version}"',
-                f'source_plan_id = "{plan_id}"',
                 'artifact_dir = "results"',
                 "task_count = 2",
                 "cell_count = 12",
@@ -266,7 +429,6 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
                 "schema_version": 1,
                 "experiment_id": experiment_id,
                 "experiment_version": experiment_version,
-                "plan_id": plan_id,
                 "rows": [],
                 "aggregates": [],
             }
@@ -275,13 +437,16 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     fieldnames = [
+        "experiment_id",
+        "experiment_version",
         "cell_id",
-        "safe_task_id",
+        "task_id",
         "task_type",
         "condition",
         "model",
         "reasoning_effort",
         "repeat",
+        "status",
         "recall_at_3",
         "recall_at_5",
         "ndcg_at_3",
@@ -293,7 +458,7 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
         "gold_seen_by_3_source_actions",
         "gold_targeted_any",
     ]
-    conditions = ["NO_DOC_GUIDANCE", "FUNCTIONAL_OPTIONAL", "FUNCTIONAL_REQUIRED_BEFORE_SOURCE"]
+    conditions = ["NO-DOC", "OPTIONAL", "DOC-FIRST"]
     with (feature_root / "cell_features.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -307,13 +472,16 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
                     quality = 0.45 + 0.05 * task_index + 0.02 * condition_index
                     writer.writerow(
                         {
+                            "experiment_id": experiment_id,
+                            "experiment_version": experiment_version,
                             "cell_id": f"cell-{task_index}-{profile_index}-{condition_index}",
-                            "safe_task_id": f"task-{task_index}",
+                            "task_id": f"task-{task_index}",
                             "task_type": task_type,
                             "condition": condition,
                             "model": model,
                             "reasoning_effort": effort,
                             "repeat": 1,
+                            "status": "succeeded",
                             "recall_at_3": quality,
                             "recall_at_5": quality + 0.02,
                             "ndcg_at_3": quality + 0.01,
@@ -330,16 +498,9 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
     result = invoke(config, "report", "--figures")
     assert result.returncode == 0, result.stdout + result.stderr
     figure_root = report_root / "figures"
-    manifest = json.loads((figure_root / "manifest.json").read_text())
-    assert manifest["experiment_id"] == experiment_id
-    assert manifest["experiment_version"] == experiment_version
-    assert manifest["plan_id"] == plan_id
-    assert manifest["figure_count"] == 8
-    assert manifest["task_count"] == 2
-    assert manifest["cell_count"] == 12
-    assert manifest["profile_count"] == 2
     assert len(list(figure_root.glob("*.png"))) == 8
     assert len(list(figure_root.glob("*.pdf"))) == 8
+    assert {path.suffix for path in figure_root.iterdir()} == {".png", ".pdf"}
     assert all(path.read_bytes().startswith(b"\x89PNG") for path in figure_root.glob("*.png"))
     assert all(path.read_bytes().startswith(b"%PDF") for path in figure_root.glob("*.pdf"))
     repeated = invoke(config, "report", "--figures")
@@ -375,30 +536,33 @@ def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
         json.loads(line) for line in (root / "features" / "data.jsonl").read_text().splitlines()
     ]
     assert len(plan["tasks"]) == 2
-    assert len(plan["cells"]) == 6
-    assert len({cell["cell_id"] for cell in plan["cells"]}) == 6
-    assert len(list((root / "claims").glob("*.json"))) == 6
-    assert len(list((root / "runs").glob("*/observation.json"))) == 6
-    assert len(features) == 6
+    assert len(plan["cells"]) == 12
+    assert len({cell["cell_id"] for cell in plan["cells"]}) == 12
+    assert len(list((root / "claims").glob("*.json"))) == 12
+    assert len(list((root / "runs").glob("*/observation.json"))) == 12
+    assert len(features) == 12
     assert all(
-        sum(row["task_id"] == task["task_id"] for row in features) == 3 for task in plan["tasks"]
+        sum(row["task_id"] == task["task_id"] for row in features) == 6 for task in plan["tasks"]
     )
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     by_task = {
         task["task_id"]: [row for row in analysis["rows"] if row["task_id"] == task["task_id"]]
         for task in plan["tasks"]
     }
-    assert all(row["gold_locator_mentioned"] for row in by_task[first_task["task_id"]])
-    assert all(not row["gold_locator_mentioned"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_path"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_filename"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_symbol"] for row in by_task[second_task["task_id"]])
+    assert all(
+        row["task_type"] == "EXPLICIT_LOCATOR_CLUE" for row in by_task[first_task["task_id"]]
+    )
+    assert all(
+        row["task_type"] == "NO_EXPLICIT_LOCATOR_CLUE" for row in by_task[second_task["task_id"]]
+    )
 
 
 def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
     fixture, config = setup(tmp_path / "invalid-provenance")
     tasks = fixture / "tasks.jsonl"
-    tasks.write_text(tasks.read_text().replace("0123456789abcdef0123456789abcdef01234567", "main"))
+    task = json.loads(tasks.read_text())
+    task["base_commit"] = "main"
+    tasks.write_text(json.dumps(task) + "\n")
     invalid_provenance = invoke(config, "prepare")
     assert invalid_provenance.returncode == 2
     assert "base_commit must be a full lowercase Git commit" in invalid_provenance.stdout
@@ -411,7 +575,7 @@ def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
     )
     drift = invoke(config, "run")
     assert drift.returncode == 4
-    assert "frozen experiment version" in drift.stdout
+    assert "under this experiment_version" in drift.stdout
 
     fixture, config = setup(tmp_path / "resume")
     assert invoke(config, "prepare").returncode == 0
@@ -428,15 +592,15 @@ def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
     terminal = invoke(config, "run")
     assert terminal.returncode == 5
     root = fixture / "artifacts" / "fixture-localization" / "v1"
-    assert len(list((root / "runs").glob("*/observation.json"))) == 3
+    assert len(list((root / "runs").glob("*/observation.json"))) == 6
     retried = invoke(config, "run", "--resume")
     assert retried.returncode == 5
-    assert "3 terminal cell(s)" in retried.stdout
+    assert "6 terminal cell(s)" in retried.stdout
     assert invoke(config, "features").returncode == 0
     assert invoke(config, "analyze").returncode == 0
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     assert [row["successful_observations"] for row in analysis["aggregates"]] == [0, 0, 0]
-    assert [row["terminal_observations"] for row in analysis["aggregates"]] == [1, 1, 1]
+    assert [row["terminal_observations"] for row in analysis["aggregates"]] == [2, 2, 2]
     assert all(row["mean_recall_at_3"] is None for row in analysis["aggregates"])
     assert invoke(config, "report").returncode == 0
 

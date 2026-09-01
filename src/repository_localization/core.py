@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import subprocess
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -19,15 +19,19 @@ CONDITIONS = (
     "OPTIONAL",
     "DOC-FIRST",
 )
-RUNNER_CONTRACT = "repository-localization-runner-v4"
+RUNNER_CONTRACT = "repository-localization-runner-v9"
 DATASET = {
     "name": "Contextbench/ContextBench",
     "config": "default",
     "split": "train",
 }
+WIKI_TOKENIZER = {
+    "package": "tiktoken",
+    "version": "0.13.0",
+    "encoding": "o200k_base",
+}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _GIT_COMMIT = re.compile(r"^[0-9a-f]{40}$")
-_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 # Operator-facing errors and shared records
@@ -52,9 +56,26 @@ class ExecutionError(PipelineError):
 
 
 @dataclass(frozen=True, slots=True)
+class Profile:
+    model: str
+    reasoning_effort: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {"model": self.model, "reasoning_effort": self.reasoning_effort}
+
+
+@dataclass(frozen=True, slots=True)
+class Repository:
+    name: str
+    path: Path
+
+    def as_dict(self) -> dict[str, str]:
+        return {"name": self.name, "path": str(self.path)}
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     path: Path
-    raw: bytes
     experiment_id: str
     experiment_version: str
     artifact_dir: Path
@@ -62,9 +83,10 @@ class Config:
     gold: Path
     dataset_revision: str
     repeats: int
+    repositories: tuple[Repository, ...]
     binary: Path
-    model: str
-    reasoning_effort: str
+    profiles: tuple[Profile, ...]
+    parallelism: int
     timeout_seconds: int
 
     @property
@@ -94,10 +116,6 @@ def canonical(value: object) -> bytes:
         )
         + "\n"
     ).encode()
-
-
-def digest(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _schema_one(value: object) -> bool:
@@ -149,6 +167,34 @@ def _integer(value: object, label: str, minimum: int, maximum: int) -> int:
     return value
 
 
+def _profiles(value: object) -> tuple[Profile, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 8:
+        raise PipelineError("runner.profiles must contain from one to eight profiles")
+    profiles: list[Profile] = []
+    seen: set[tuple[str, str]] = set()
+    for number, raw in enumerate(value, 1):
+        profile = _table(
+            raw,
+            f"runner.profiles entry {number}",
+            {"model", "reasoning_effort"},
+        )
+        model = _text(profile["model"], f"runner.profiles entry {number} model")
+        effort = _text(
+            profile["reasoning_effort"],
+            f"runner.profiles entry {number} reasoning_effort",
+        )
+        if effort not in {"low", "medium", "high", "xhigh"}:
+            raise PipelineError(
+                "runner profile reasoning_effort must be low, medium, high, or xhigh"
+            )
+        identity = (model, effort)
+        if identity in seen:
+            raise PipelineError("runner.profiles must contain unique model/reasoning pairs")
+        seen.add(identity)
+        profiles.append(Profile(model, effort))
+    return tuple(profiles)
+
+
 def _table(value: object, label: str, keys: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != keys:
         raise PipelineError(f"{label} must contain exactly: {', '.join(sorted(keys))}")
@@ -186,30 +232,41 @@ def _read_file(path: Path, label: str) -> bytes:
         raise PipelineError(f"{label}: missing, linked, or unreadable: {path}") from exc
 
 
-def _read_executable(path: Path) -> tuple[bytes, dict[str, str]]:
-    payload = _read_file(path, "Codex binary")
-    if not os.access(path, os.X_OK):
-        raise PipelineError(f"Codex binary is not executable: {path}")
-    runtime = {"kind": "native"}
-    if payload.startswith(b"#!"):
-        try:
-            shebang = payload.splitlines()[0][2:].decode().strip().split()
-        except UnicodeDecodeError as exc:
-            raise PipelineError("Codex binary has an invalid shebang") from exc
-        if len(shebang) != 1 or not shebang[0].startswith("/"):
-            raise PipelineError("Codex script must use one absolute interpreter without arguments")
-        interpreter = Path(shebang[0])
-        if interpreter.name == "env":
-            raise PipelineError("Codex script must not depend on /usr/bin/env or ambient PATH")
-        interpreter_bytes = _read_file(interpreter, "Codex script interpreter")
-        if not os.access(interpreter, os.X_OK):
-            raise PipelineError(f"Codex script interpreter is not executable: {interpreter}")
-        runtime = {
-            "kind": "script",
-            "interpreter": str(interpreter),
-            "interpreter_checksum": digest(interpreter_bytes),
-        }
-    return payload, runtime
+def _executable_version(path: Path) -> str:
+    try:
+        _no_link_components(path, "Codex binary")
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK):
+            raise OSError("not executable")
+        completed = subprocess.run(
+            [str(path), "--version"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PipelineError(f"Codex binary is missing or not executable: {path}") from exc
+    output = (completed.stdout or completed.stderr).decode("utf-8", errors="replace").strip()
+    if completed.returncode != 0 or not output or "\n" in output:
+        raise PipelineError("Codex binary did not return one version line")
+    return output
+
+
+def _repositories(value: object, base: Path) -> tuple[Repository, ...]:
+    if not isinstance(value, list) or not value:
+        raise PipelineError("repositories must contain at least one Git repository")
+    repositories: list[Repository] = []
+    seen: set[str] = set()
+    for number, raw in enumerate(value, 1):
+        row = _table(raw, f"repositories entry {number}", {"name", "path"})
+        name = _text(row["name"], f"repositories entry {number} name", single_line=True)
+        if name in seen:
+            raise PipelineError(f"duplicate repository: {name}")
+        seen.add(name)
+        repositories.append(
+            Repository(name=name, path=_absolute(base, row["path"], "repository path"))
+        )
+    return tuple(repositories)
 
 
 def load_config(path: Path) -> Config:
@@ -229,6 +286,7 @@ def load_config(path: Path) -> Config:
             "artifact_dir",
             "inputs",
             "design",
+            "repositories",
             "runner",
         },
     )
@@ -239,15 +297,11 @@ def load_config(path: Path) -> Config:
     runner = _table(
         top["runner"],
         "runner",
-        {"binary", "model", "reasoning_effort", "timeout_seconds"},
+        {"binary", "parallelism", "profiles", "timeout_seconds"},
     )
-    effort = _text(runner["reasoning_effort"], "runner.reasoning_effort")
-    if effort not in {"low", "medium", "high", "xhigh"}:
-        raise PipelineError("runner.reasoning_effort must be low, medium, high, or xhigh")
     base = path.parent
     return Config(
         path=path,
-        raw=raw,
         experiment_id=_safe_id(top["experiment_id"], "experiment_id"),
         experiment_version=_safe_id(top["experiment_version"], "experiment_version"),
         artifact_dir=_absolute(base, top["artifact_dir"], "artifact_dir"),
@@ -255,9 +309,10 @@ def load_config(path: Path) -> Config:
         gold=_absolute(base, inputs["gold"], "inputs.gold"),
         dataset_revision=_git_commit(inputs["dataset_revision"], "inputs.dataset_revision"),
         repeats=_integer(design["repeats"], "design.repeats", 1, 20),
+        repositories=_repositories(top["repositories"], base),
         binary=_absolute(base, runner["binary"], "runner.binary"),
-        model=_text(runner["model"], "runner.model"),
-        reasoning_effort=effort,
+        profiles=_profiles(runner["profiles"]),
+        parallelism=_integer(runner["parallelism"], "runner.parallelism", 1, 8),
         timeout_seconds=_integer(runner["timeout_seconds"], "runner.timeout_seconds", 1, 7200),
     )
 
