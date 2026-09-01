@@ -104,9 +104,8 @@ cp experiment.example.toml experiment.toml
 ```
 
 Повний контракт запуску наведений один раз у
-[`experiment.example.toml`](experiment.example.toml). Джерело даних для спільного notebook
-задається окремим малим [`eda.example.toml`](eda.example.toml), щоб не змінювати вже заморожений
-`experiment.toml`.
+[`experiment.example.toml`](experiment.example.toml). Той самий `experiment.toml` використовують
+команди пайплайна і спільний notebook; окремої EDA-конфігурації немає.
 
 `dataset_revision` — повний Git commit набору ContextBench, з якого зовні підготовлено вибірку.
 `experiment_version` задає оператор. Вона записується в усі артефакти запуску. `prepare` також
@@ -184,7 +183,6 @@ snapshots і результати випадково не потрапляють
 ```bash
 git switch -c experiment/<experiment-id>-<experiment-version>
 cp experiment.example.toml experiment.toml
-cp eda.example.toml eda.toml
 # Підготуйте experiment.toml, tasks.jsonl, protected/gold.jsonl і локальні source_root.
 
 git add -f experiment.toml tasks.jsonl
@@ -208,16 +206,16 @@ uv run repository-localization report experiment.toml
 ```
 
 `report` не копіює notebook у каталог результатів. Після його виконання відкрийте один спільний
-[`analysis/eda.ipynb`](analysis/eda.ipynb). Notebook читає шлях до `eda.toml` зі змінної
-`EDA_CONFIG` або використовує `eda.toml` у поточному каталозі:
+[`analysis/eda.ipynb`](analysis/eda.ipynb). Notebook читає той самий `experiment.toml` зі змінної
+`EXPERIMENT_CONFIG` або використовує `experiment.toml` у поточному каталозі:
 
 ```bash
-EDA_CONFIG=eda.toml jupyter lab analysis/eda.ipynb
+EXPERIMENT_CONFIG=experiment.toml jupyter lab analysis/eda.ipynb
 ```
 
-У `eda.toml` змінюється лише шлях до конфігурації експерименту. Корінь версованих артефактів
-обчислюється з `artifact_dir`, `experiment_id` та `experiment_version`; шлях `data`
-задається відносно цього кореня.
+Notebook обчислює шлях до `report/data.json` із `artifact_dir`, `experiment_id` та
+`experiment_version`. Тому конфігурація запуску й джерело EDA завжди описують одну версію
+експерименту.
 
 Після завершення додайте створені артефакти другим окремим комітом:
 
