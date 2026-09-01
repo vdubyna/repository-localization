@@ -1,0 +1,17 @@
+schema_version = 1
+experiment_id = "82-tasks"
+experiment_version = "2026-09-01-v1"
+source_plan_id = "0153a6e87214cac2efcebbf590ae87d366ed9f724598611289e4b308a727189f"
+source_bundle = "2026-09-01-plan-0153a6e8-01"
+artifact_dir = "../../results/82-tasks/2026-09-01-v1"
+dataset = "Contextbench/ContextBench"
+task_count = 82
+cell_count = 1968
+repository_count = 6
+profile_count = 8
+conditions = ["NO-DOC", "OPTIONAL", "DOC-FIRST"]
+
+[source_condition_labels]
+NO_DOC_GUIDANCE = "NO-DOC"
+FUNCTIONAL_OPTIONAL = "OPTIONAL"
+FUNCTIONAL_REQUIRED_BEFORE_SOURCE = "DOC-FIRST"
