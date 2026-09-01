@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+import re
+import unicodedata
 from math import log2
 from pathlib import Path
 from statistics import fmean
@@ -14,10 +17,12 @@ from repository_localization.core import (
     IntegrityError,
     PipelineError,
     StateError,
+    _absolute,
     _files,
     _jsonl,
     _paths,
     _publish,
+    _read_file,
     _safe_id,
     _schema_one,
     _table,
@@ -30,6 +35,65 @@ from repository_localization.execution import _runs
 from repository_localization.planning import _current, _read_plan, _task_map, identity
 
 # Feature extraction from durable run evidence
+
+_PATH = re.compile(r"(?<![A-Za-z0-9_./-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?![A-Za-z0-9_./-])")
+_FILENAME = re.compile(
+    r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+\."
+    r"(?:cfg|css|html?|ini|ipynb|js|json|md|pyi?|rst|sh|toml|ts|txt|ya?ml)"
+    r"(?![A-Za-z0-9_.-])",
+    re.IGNORECASE,
+)
+_BACKTICK_SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)`")
+_CALL_SYMBOL = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_WORD = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _normalized(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _prompt_locators(prompt: str) -> dict[str, set[str]]:
+    paths = {_normalized(value) for value in _PATH.findall(prompt)}
+    filenames = {_normalized(value) for value in _FILENAME.findall(prompt)}
+    symbols: set[str] = set()
+    for qualified in _BACKTICK_SYMBOL.findall(prompt):
+        symbols.update(_normalized(part) for part in qualified.split("."))
+    symbols.update(_normalized(value) for value in _CALL_SYMBOL.findall(prompt))
+    for word in _WORD.findall(prompt):
+        body = word.strip("_")
+        if "_" in body or (
+            any(character.islower() for character in body)
+            and sum(character.isupper() for character in body) >= 2
+        ):
+            symbols.add(_normalized(word))
+    return {"paths": paths, "filenames": filenames, "symbols": symbols}
+
+
+def _prompt_features(prompt: str) -> dict[str, bool]:
+    locators = _prompt_locators(prompt)
+    return {
+        "prompt_has_path": bool(locators["paths"]),
+        "prompt_has_filename": bool(locators["filenames"]),
+        "prompt_has_symbol": bool(locators["symbols"]),
+    }
+
+
+def _task_source_roots(config: Config) -> dict[str, Path]:
+    _, rows = _jsonl(config.tasks, "tasks JSONL")
+    result: dict[str, Path] = {}
+    keys = {
+        "task_id",
+        "repository",
+        "base_commit",
+        "prompt",
+        "source_root",
+        "documentation_entry",
+    }
+    for number, row in enumerate(rows, 1):
+        row = _table(row, f"tasks row {number}", keys)
+        task_id = _safe_id(row["task_id"], f"tasks row {number} task_id")
+        result[task_id] = _absolute(config.path.parent, row["source_root"], "source_root")
+    return result
 
 
 def _durable_runs(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -46,10 +110,12 @@ def _manifest(plan: dict[str, Any], checksum: str) -> dict[str, Any]:
 
 def _feature_rows(plan: dict[str, Any], runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     repositories = {task["task_id"]: task["repository"] for task in plan["tasks"]}
+    task_features = {task["task_id"]: _prompt_features(task["prompt"]) for task in plan["tasks"]}
     return [
         {
             "schema_version": 1,
             **identity(plan),
+            **task_features[row["task_id"]],
             "cell_id": row["cell_id"],
             "task_id": row["task_id"],
             "repository": repositories[row["task_id"]],
@@ -122,6 +188,47 @@ def _load_gold(config: Config, plan: dict[str, Any]) -> tuple[bytes, dict[str, l
     return raw, result
 
 
+def _python_symbols(path: Path) -> set[str]:
+    if path.suffix not in {".py", ".pyi"}:
+        return set()
+    payload = _read_file(path, "gold source file")
+    try:
+        tree = ast.parse(payload, filename=str(path))
+    except (SyntaxError, ValueError):
+        return set()
+    return {
+        _normalized(node.name)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+
+
+def _gold_locator_mentioned(prompt: str, gold_files: list[str], source_root: Path) -> bool:
+    locators = _prompt_locators(prompt)
+    for relative in gold_files:
+        path = Path(relative)
+        if (
+            _normalized(path.as_posix()) in locators["paths"]
+            or _normalized(path.name) in locators["filenames"]
+        ):
+            return True
+        if _python_symbols(source_root / path).intersection(locators["symbols"]):
+            return True
+    return False
+
+
+def _gold_locator_mentions(
+    config: Config, plan: dict[str, Any], gold: dict[str, list[str]]
+) -> dict[str, bool]:
+    source_roots = _task_source_roots(config)
+    return {
+        task["task_id"]: _gold_locator_mentioned(
+            task["prompt"], gold[task["task_id"]], source_roots[task["task_id"]]
+        )
+        for task in plan["tasks"]
+    }
+
+
 # Gold-aware metrics
 
 
@@ -132,11 +239,16 @@ def analyze(config_path: Path) -> tuple[dict[str, str], Path]:
     expected_tasks = {task["task_id"] for task in plan["tasks"]}
     if set(gold) != expected_tasks:
         raise PipelineError("gold task coverage must exactly match public tasks")
+    gold_mentions = _gold_locator_mentions(config, plan, gold)
     rows: list[dict[str, Any]] = []
     for feature in feature_rows:
         gold_files = set(gold[feature["task_id"]])
         common = {
             **identity(plan),
+            "prompt_has_path": feature["prompt_has_path"],
+            "prompt_has_filename": feature["prompt_has_filename"],
+            "prompt_has_symbol": feature["prompt_has_symbol"],
+            "gold_locator_mentioned": gold_mentions[feature["task_id"]],
             "cell_id": feature["cell_id"],
             "task_id": feature["task_id"],
             "repository": feature["repository"],
@@ -268,6 +380,10 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
         raise IntegrityError("analysis rows are invalid")
     row_keys = {
         *identity(plan),
+        "prompt_has_path",
+        "prompt_has_filename",
+        "prompt_has_symbol",
+        "gold_locator_mentioned",
         "cell_id",
         "task_id",
         "repository",
@@ -291,6 +407,7 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
     }
     tasks = _task_map(plan)
     gold_counts: dict[str, int] = {}
+    gold_mentions: dict[str, bool] = {}
     for row, cell, feature in zip(rows, plan["cells"], feature_rows, strict=True):
         if not isinstance(row, dict) or set(row) != row_keys:
             raise IntegrityError("analysis row shape is invalid")
@@ -304,6 +421,16 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
             or row.get("terminal_reason") != feature["terminal_reason"]
         ):
             raise IntegrityError("analysis row does not match the plan")
+        prompt_feature_keys = (
+            "prompt_has_path",
+            "prompt_has_filename",
+            "prompt_has_symbol",
+        )
+        if (
+            any(row[key] != feature[key] for key in prompt_feature_keys)
+            or type(row["gold_locator_mentioned"]) is not bool
+        ):
+            raise IntegrityError("analysis locator features are invalid")
         gold_count = row["gold_file_count"]
         matched_at_3 = row["matched_gold_at_3"]
         matched_at_5 = row["matched_gold_at_5"]
@@ -324,6 +451,11 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
         previous_gold_count = gold_counts.setdefault(row["task_id"], gold_count)
         if previous_gold_count != gold_count:
             raise IntegrityError("analysis gold count is inconsistent")
+        previous_gold_mention = gold_mentions.setdefault(
+            row["task_id"], row["gold_locator_mentioned"]
+        )
+        if previous_gold_mention != row["gold_locator_mentioned"]:
+            raise IntegrityError("analysis gold locator feature is inconsistent")
         relevance = row["relevance_at_3"]
         if row["status"] == "terminal":
             if (

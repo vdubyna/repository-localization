@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from repository_localization.analysis import _gold_locator_mentioned, _prompt_features
+
 FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 
 
@@ -87,6 +89,24 @@ def invoke(config: Path, command: str, *arguments: str) -> subprocess.CompletedP
     )
 
 
+def test_task_locator_features_are_explicit_and_gold_aware(tmp_path: Path) -> None:
+    assert _prompt_features("Tested on 1.8 and 1.6.2.") == {
+        "prompt_has_path": False,
+        "prompt_has_filename": False,
+        "prompt_has_symbol": False,
+    }
+    assert _prompt_features("Edit `pkg/service.py` and ServiceHandler.run().") == {
+        "prompt_has_path": True,
+        "prompt_has_filename": True,
+        "prompt_has_symbol": True,
+    }
+    source = tmp_path / "pkg"
+    source.mkdir()
+    (source / "service.py").write_text("def greeting():\n    return 'hello'\n")
+    assert _gold_locator_mentioned("Fix `greeting`.", ["pkg/service.py"], tmp_path)
+    assert not _gold_locator_mentioned("Fix unrelated behavior.", ["pkg/service.py"], tmp_path)
+
+
 def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None:
     fixture, config = setup(tmp_path)
     gold = fixture / "gold.jsonl"
@@ -98,8 +118,7 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         assert result.returncode == 0, result.stdout + result.stderr
         assert "version: v1" in result.stdout
 
-    hidden_gold.rename(gold)
-    gold_payload = gold.read_bytes()
+    gold_payload = hidden_gold.read_bytes()
     root = fixture / "artifacts" / "fixture-localization" / "v1"
     first_observation = next((root / "runs").glob("*/observation.json"))
     observation_payload = first_observation.read_bytes()
@@ -123,6 +142,15 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
 
     featured = invoke(config, "features")
     assert featured.returncode == 0, featured.stdout + featured.stderr
+    feature_rows = [
+        json.loads(line) for line in (root / "features" / "data.jsonl").read_text().splitlines()
+    ]
+    assert all(row["prompt_has_path"] for row in feature_rows)
+    assert all(row["prompt_has_filename"] for row in feature_rows)
+    assert all(row["prompt_has_symbol"] for row in feature_rows)
+    assert all("gold_locator_mentioned" not in row for row in feature_rows)
+
+    hidden_gold.rename(gold)
 
     gold.write_text('{"task_id":"ContextBench__fixture-task","files":["pkg/missing.py"]}\n')
     invalid_gold = invoke(config, "analyze")
@@ -161,6 +189,10 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     assert [row["mean_returned_set_f1"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["successful_observations"] for row in analysis["aggregates"]] == [1, 1, 1]
     assert [row["terminal_observations"] for row in analysis["aggregates"]] == [0, 0, 0]
+    assert all(row["prompt_has_path"] for row in analysis["rows"])
+    assert all(row["prompt_has_filename"] for row in analysis["rows"])
+    assert all(row["prompt_has_symbol"] for row in analysis["rows"])
+    assert all(row["gold_locator_mentioned"] for row in analysis["rows"])
     json_artifacts = [
         *sorted((root / "claims").glob("*.json")),
         *sorted((root / "runs").glob("*/manifest.json")),
@@ -238,6 +270,16 @@ def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
     assert all(
         sum(row["task_id"] == task["task_id"] for row in features) == 3 for task in plan["tasks"]
     )
+    analysis = json.loads((root / "analysis" / "data.json").read_text())
+    by_task = {
+        task["task_id"]: [row for row in analysis["rows"] if row["task_id"] == task["task_id"]]
+        for task in plan["tasks"]
+    }
+    assert all(row["gold_locator_mentioned"] for row in by_task[first_task["task_id"]])
+    assert all(not row["gold_locator_mentioned"] for row in by_task[second_task["task_id"]])
+    assert all(not row["prompt_has_path"] for row in by_task[second_task["task_id"]])
+    assert all(not row["prompt_has_filename"] for row in by_task[second_task["task_id"]])
+    assert all(not row["prompt_has_symbol"] for row in by_task[second_task["task_id"]])
 
 
 def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
