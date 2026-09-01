@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Versioned Codex localization experiment pipeline."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "matplotlib>=3.10,<4",
+]
 
 [project.scripts]
 repository-localization = "repository_localization.cli:main"
