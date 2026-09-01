@@ -11,7 +11,9 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -207,6 +209,7 @@ def _bounded_process(
     environment: dict[str, str],
     temporary: Path,
     timeout: int,
+    stop: threading.Event,
 ) -> tuple[int, bytes, bytes, bool, bool, bool]:
     limit = 16 * 1024 * 1024
     stdout_path = temporary / "events.jsonl"
@@ -251,6 +254,9 @@ def _bounded_process(
             process.stdin = None
             deadline = time.monotonic() + timeout
             while process.poll() is None:
+                if stop.is_set():
+                    terminate()
+                    raise InterruptedError("parallel run was interrupted")
                 if time.monotonic() >= deadline:
                     timed_out = True
                     terminate()
@@ -407,6 +413,7 @@ def _execute(
     task: dict[str, Any],
     cell: dict[str, Any],
     repository: Path,
+    stop: threading.Event,
 ) -> Evidence:
     runner = plan["runner"]
     binary = Path(runner["binary"])
@@ -416,6 +423,8 @@ def _execute(
     final_output = b""
     terminal_reason: str | None = None
     try:
+        if stop.is_set():
+            raise InterruptedError("parallel run was interrupted")
         with tempfile.TemporaryDirectory(prefix="repository-localization-cell-") as raw_temporary:
             temporary = Path(raw_temporary).resolve()
             schema = temporary / "prediction-schema.json"
@@ -475,6 +484,7 @@ def _execute(
                 _isolated_environment(temporary),
                 temporary,
                 runner["timeout_seconds"],
+                stop,
             )
             if output.exists():
                 info = output.lstat()
@@ -561,52 +571,104 @@ def run(config_path: Path, *, resume: bool) -> tuple[dict[str, str], Path]:
     if runs and not resume:
         raise StateError("run already contains completed cells; use run --resume")
     tasks = _task_map(plan)
+    cells = list(enumerate(plan["cells"], 1))
     if len(runs) < len(plan["cells"]):
         _credentials()
+    stop = threading.Event()
     with tempfile.TemporaryDirectory(prefix="repository-localization-run-") as raw_run:
         run_root = Path(raw_run).resolve()
         (run_root / "bases").mkdir()
         (run_root / "workspaces").mkdir()
         workspaces: dict[tuple[str, str], Path] = {}
-        for ordinal, cell in enumerate(plan["cells"], 1):
-            if cell["cell_id"] in runs:
+        for task_id, task in tasks.items():
+            pending = [
+                (ordinal, cell)
+                for ordinal, cell in cells
+                if cell["task_id"] == task_id and cell["cell_id"] not in runs
+            ]
+            if not pending:
                 continue
-            task = tasks[cell["task_id"]]
-            key = (cell["task_id"], cell["condition"])
-            if key not in workspaces:
-                base = run_root / "bases" / cell["task_id"]
-                repository = run_root / "workspaces" / f"{cell['task_id']}-{cell['condition']}"
-                _materialize(task, cell["condition"], base, repository)
+            for condition in sorted({cell["condition"] for _, cell in pending}):
+                key = (task_id, condition)
+                base = run_root / "bases" / task_id
+                repository = run_root / "workspaces" / f"{task_id}-{condition}"
+                _materialize(task, condition, base, repository)
                 workspaces[key] = repository
-            print(
-                f"run {ordinal}/{len(plan['cells'])}: {cell['task_id']} {cell['condition']} "
-                f"{cell['model']}/{cell['reasoning_effort']}",
-                flush=True,
+
+            iterator = iter(pending)
+            active: dict[Future[Evidence], tuple[int, dict[str, Any]]] = {}
+            failure: ExecutionError | None = None
+            executor = ThreadPoolExecutor(
+                max_workers=plan["runner"]["parallelism"],
+                thread_name_prefix="repository-localization",
             )
-            claim = {"schema_version": 1, **identity(plan), **cell}
-            claimed = _write_once(
-                config.root / "claims" / f"{cell['cell_id']}.json", canonical(claim)
-            )
-            if not claimed:
-                raise StateError(f"cell {cell['cell_id']} was claimed by another runner")
-            evidence = _execute(plan, task, cell, workspaces[key])
-            _publish(
-                config.root / "runs" / cell["cell_id"],
-                {
-                    "observation.json": canonical(evidence.observation),
-                    "events.jsonl": evidence.events,
-                    "stderr.log": evidence.stderr,
-                    "final-output.json": evidence.final_output,
-                },
-            )
-            runs[cell["cell_id"]] = evidence.observation
-            reason = evidence.observation.get("terminal_reason")
-            if reason == "condition_violation":
-                raise ExecutionError(
-                    f"{cell['cell_id']}: DOC-FIRST did not read the configured entry first"
-                )
-            if reason == "forbidden_tool":
-                raise ExecutionError(f"{cell['cell_id']}: Codex used a forbidden external tool")
+            try:
+                while True:
+                    while failure is None and len(active) < plan["runner"]["parallelism"]:
+                        try:
+                            ordinal, cell = next(iterator)
+                        except StopIteration:
+                            break
+                        print(
+                            f"run start {ordinal}/{len(plan['cells'])}: {cell['task_id']} "
+                            f"{cell['condition']} {cell['model']}/{cell['reasoning_effort']}",
+                            flush=True,
+                        )
+                        claim = {"schema_version": 1, **identity(plan), **cell}
+                        claimed = _write_once(
+                            config.root / "claims" / f"{cell['cell_id']}.json",
+                            canonical(claim),
+                        )
+                        if not claimed:
+                            raise StateError(
+                                f"cell {cell['cell_id']} was claimed by another runner"
+                            )
+                        key = (task_id, cell["condition"])
+                        future = executor.submit(
+                            _execute,
+                            plan,
+                            task,
+                            cell,
+                            workspaces[key],
+                            stop,
+                        )
+                        active[future] = (ordinal, cell)
+                    if not active:
+                        break
+                    completed = next(as_completed(active))
+                    ordinal, cell = active.pop(completed)
+                    evidence = completed.result()
+                    _publish(
+                        config.root / "runs" / cell["cell_id"],
+                        {
+                            "observation.json": canonical(evidence.observation),
+                            "events.jsonl": evidence.events,
+                            "stderr.log": evidence.stderr,
+                            "final-output.json": evidence.final_output,
+                        },
+                    )
+                    runs[cell["cell_id"]] = evidence.observation
+                    print(
+                        f"run done {ordinal}/{len(plan['cells'])}: "
+                        f"{evidence.observation['status']}",
+                        flush=True,
+                    )
+                    reason = evidence.observation.get("terminal_reason")
+                    if reason == "condition_violation" and failure is None:
+                        failure = ExecutionError(
+                            f"{cell['cell_id']}: DOC-FIRST did not read the configured entry first"
+                        )
+                    if reason == "forbidden_tool" and failure is None:
+                        failure = ExecutionError(
+                            f"{cell['cell_id']}: Codex used a forbidden external tool"
+                        )
+                if failure is not None:
+                    raise failure
+            except BaseException:
+                stop.set()
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
     terminals = [
         f"{cell['cell_id']}:{runs[cell['cell_id']]['terminal_reason']}"
         for cell in plan["cells"]

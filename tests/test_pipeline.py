@@ -202,7 +202,10 @@ def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
         f'\n[[runner.profiles]]\nmodel = "fixture-{number}"\nreasoning_effort = "high"\n'
         for number in range(3, 9)
     )
-    config.write_text(config.read_text(encoding="utf-8") + profiles, encoding="utf-8")
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("parallelism = 1", "parallelism = 8") + profiles,
+        encoding="utf-8",
+    )
 
     prepared = invoke(config, "prepare")
 
@@ -211,7 +214,15 @@ def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
         (fixture / "artifacts" / "fixture-localization" / "v1" / "plan.json").read_text()
     )
     assert len(plan["runner"]["profiles"]) == 8
+    assert plan["runner"]["parallelism"] == 8
     assert len(plan["cells"]) == 24
+    executed = invoke(config, "run")
+    assert executed.returncode == 0, executed.stdout + executed.stderr
+    output_lines = executed.stdout.splitlines()
+    first_done = next(number for number, line in enumerate(output_lines) if "run done" in line)
+    assert sum("run start" in line for line in output_lines[:first_done]) == 8
+    root = fixture / "artifacts" / "fixture-localization" / "v1"
+    assert len(list((root / "runs").glob("*/observation.json"))) == 24
 
 
 def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None:

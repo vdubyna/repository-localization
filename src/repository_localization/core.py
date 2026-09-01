@@ -19,7 +19,7 @@ CONDITIONS = (
     "OPTIONAL",
     "DOC-FIRST",
 )
-RUNNER_CONTRACT = "repository-localization-runner-v8"
+RUNNER_CONTRACT = "repository-localization-runner-v9"
 DATASET = {
     "name": "Contextbench/ContextBench",
     "config": "default",
@@ -86,6 +86,7 @@ class Config:
     repositories: tuple[Repository, ...]
     binary: Path
     profiles: tuple[Profile, ...]
+    parallelism: int
     timeout_seconds: int
 
     @property
@@ -296,7 +297,7 @@ def load_config(path: Path) -> Config:
     runner = _table(
         top["runner"],
         "runner",
-        {"binary", "profiles", "timeout_seconds"},
+        {"binary", "parallelism", "profiles", "timeout_seconds"},
     )
     base = path.parent
     return Config(
@@ -311,6 +312,7 @@ def load_config(path: Path) -> Config:
         repositories=_repositories(top["repositories"], base),
         binary=_absolute(base, runner["binary"], "runner.binary"),
         profiles=_profiles(runner["profiles"]),
+        parallelism=_integer(runner["parallelism"], "runner.parallelism", 1, 8),
         timeout_seconds=_integer(runner["timeout_seconds"], "runner.timeout_seconds", 1, 7200),
     )
 
