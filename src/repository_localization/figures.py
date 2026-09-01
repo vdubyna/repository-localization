@@ -25,8 +25,6 @@ from repository_localization.core import (  # noqa: E402
     PipelineError,
     _publish,
     _read_file,
-    canonical,
-    digest,
     strict_json,
 )
 
@@ -54,7 +52,6 @@ TRAJECTORY = {
 REQUIRED_COLUMNS = {
     "experiment_id",
     "experiment_version",
-    "plan_id",
     "cell_id",
     "task_id",
     "task_type",
@@ -98,7 +95,6 @@ class FigureInput:
     identity: dict[str, str]
     artifact_root: Path
     source_path: Path
-    source_checksum: str
     cells: list[Cell]
 
 
@@ -156,17 +152,12 @@ def _record(config_path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     ):
         if report.get(key) != expected:
             raise IntegrityError(f"report data has the wrong {key}")
-    plan_id = _text(report.get("plan_id"), "report plan_id")
-    declared_plan = record.get("source_plan_id", record.get("plan_id"))
-    if declared_plan is not None and declared_plan != plan_id:
-        raise IntegrityError("experiment config and report data have different plan_id values")
     return (
         record,
         root,
         {
             "experiment_id": experiment_id,
             "experiment_version": experiment_version,
-            "plan_id": plan_id,
         },
     )
 
@@ -270,7 +261,7 @@ def _input(config_path: Path) -> FigureInput:
     payload = _read_file(source, "cell feature table")
     cells = _cells(payload, identity)
     _validate_design(record, cells)
-    return FigureInput(identity, root, source, digest(payload), cells)
+    return FigureInput(identity, root, source, cells)
 
 
 def _mean(cells: list[Cell], condition: str, metric: str) -> float:
@@ -652,9 +643,7 @@ FIGURES = (
 
 def _render(figure: Figure, title: str, identity: dict[str, str], format_name: str) -> bytes:
     target = io.BytesIO()
-    description = (
-        f"{identity['experiment_id']} {identity['experiment_version']}; plan {identity['plan_id']}"
-    )
+    description = f"{identity['experiment_id']} {identity['experiment_version']}"
     metadata: dict[str, Any]
     if format_name == "png":
         metadata = {
@@ -682,7 +671,7 @@ def _render(figure: Figure, title: str, identity: dict[str, str], format_name: s
 
 
 def figures(config_path: Path) -> tuple[dict[str, str], Path]:
-    """Publish PNG/PDF figures and a checksum manifest without rerunning the provider."""
+    """Publish PNG/PDF figures without rerunning the provider."""
     source = _input(config_path)
     matplotlib.rcParams.update(
         {
@@ -696,9 +685,8 @@ def figures(config_path: Path) -> tuple[dict[str, str], Path]:
         }
     )
     files: dict[str, bytes] = {}
-    entries = []
     for stem, factory in FIGURES:
-        figure, title, summary = factory(source)
+        figure, title, _summary = factory(source)
         try:
             png = _render(figure, title, source.identity, "png")
             pdf = _render(figure, title, source.identity, "pdf")
@@ -706,29 +694,6 @@ def figures(config_path: Path) -> tuple[dict[str, str], Path]:
             plt.close(figure)
         files[f"{stem}.png"] = png
         files[f"{stem}.pdf"] = pdf
-        entries.append(
-            {
-                "figure": stem,
-                "title": title,
-                "summary": summary,
-                "files": {
-                    "png": {"name": f"{stem}.png", "checksum": digest(png)},
-                    "pdf": {"name": f"{stem}.pdf", "checksum": digest(pdf)},
-                },
-            }
-        )
-    manifest = {
-        "schema_version": 1,
-        **source.identity,
-        "source": "features/cell_features.csv",
-        "source_checksum": source.source_checksum,
-        "task_count": len({cell.task_id for cell in source.cells}),
-        "cell_count": len(source.cells),
-        "profile_count": len({(cell.model, cell.reasoning_effort) for cell in source.cells}),
-        "figure_count": len(entries),
-        "figures": entries,
-    }
-    files["manifest.json"] = canonical(manifest)
     root = source.artifact_root / "report" / "figures"
     _publish(root, files)
     return source.identity, root
