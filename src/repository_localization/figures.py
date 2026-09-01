@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 import io
+import os
+import tempfile
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass
@@ -12,7 +14,11 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any, Callable
 
-import matplotlib
+_MPL_CONFIG = Path(tempfile.gettempdir()) / "repository-localization-matplotlib"
+_MPL_CONFIG.mkdir(mode=0o700, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CONFIG))
+
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
 
@@ -96,6 +102,8 @@ class FigureInput:
     artifact_root: Path
     source_path: Path
     cells: list[Cell]
+    total_cells: int
+    terminal_cells: int
 
 
 def _text(value: object, label: str) -> str:
@@ -162,7 +170,7 @@ def _record(config_path: Path) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     )
 
 
-def _cells(payload: bytes, identity: dict[str, str]) -> list[Cell]:
+def _cells(payload: bytes, identity: dict[str, str]) -> tuple[list[Cell], int, int]:
     try:
         reader = csv.DictReader(io.StringIO(payload.decode("utf-8"), newline=""))
     except UnicodeDecodeError as exc:
@@ -172,6 +180,7 @@ def _cells(payload: bytes, identity: dict[str, str]) -> list[Cell]:
         raise PipelineError(f"cell feature table is missing columns: {missing}")
     result: list[Cell] = []
     seen: set[str] = set()
+    terminal_cells = 0
     for number, row in enumerate(reader, 2):
         if any(row.get(key) != value for key, value in identity.items()):
             raise IntegrityError(f"cell row {number} has the wrong experiment identity")
@@ -182,8 +191,12 @@ def _cells(payload: bytes, identity: dict[str, str]) -> list[Cell]:
         condition = _text(row.get("condition"), f"cell row {number} condition")
         if condition not in CONDITIONS:
             raise PipelineError(f"cell row {number} has unsupported condition: {condition}")
-        if row.get("status") != "succeeded":
-            raise PipelineError(f"cell row {number} is not a successful observation")
+        status = row.get("status")
+        if status == "terminal":
+            terminal_cells += 1
+            continue
+        if status != "succeeded":
+            raise PipelineError(f"cell row {number} has unsupported status: {status}")
         task_type = _text(row.get("task_type"), f"cell row {number} task_type")
         if task_type not in TASK_TYPES:
             raise PipelineError(f"cell row {number} has unsupported task_type: {task_type}")
@@ -226,11 +239,11 @@ def _cells(payload: bytes, identity: dict[str, str]) -> list[Cell]:
             )
         )
     if not result:
-        raise PipelineError("cell feature table is empty")
-    return result
+        raise PipelineError("cell feature table has no successful observations")
+    return result, len(seen), terminal_cells
 
 
-def _validate_design(record: dict[str, Any], cells: list[Cell]) -> None:
+def _validate_design(record: dict[str, Any], cells: list[Cell], total_cells: int) -> None:
     if {cell.condition for cell in cells} != set(CONDITIONS):
         raise PipelineError("figures require NO-DOC, OPTIONAL, and DOC-FIRST observations")
     task_types: dict[str, str] = {}
@@ -241,12 +254,11 @@ def _validate_design(record: dict[str, Any], cells: list[Cell]) -> None:
             raise IntegrityError(f"task_type changes within task {cell.task_id}")
         counts[cell.task_id, cell.condition] += 1
     for task_id in task_types:
-        task_counts = {counts[task_id, condition] for condition in CONDITIONS}
-        if len(task_counts) != 1 or 0 in task_counts:
-            raise IntegrityError(f"unbalanced conditions for task {task_id}")
+        if any(counts[task_id, condition] == 0 for condition in CONDITIONS):
+            raise IntegrityError(f"successful observations do not cover every condition: {task_id}")
     expectations = {
         "task_count": len(task_types),
-        "cell_count": len(cells),
+        "cell_count": total_cells,
         "profile_count": len({(cell.model, cell.reasoning_effort) for cell in cells}),
     }
     for key, actual in expectations.items():
@@ -259,9 +271,9 @@ def _input(config_path: Path) -> FigureInput:
     record, root, identity = _record(config_path)
     source = root / "features" / "cell_features.csv"
     payload = _read_file(source, "cell feature table")
-    cells = _cells(payload, identity)
-    _validate_design(record, cells)
-    return FigureInput(identity, root, source, cells)
+    cells, total_cells, terminal_cells = _cells(payload, identity)
+    _validate_design(record, cells, total_cells)
+    return FigureInput(identity, root, source, cells, total_cells, terminal_cells)
 
 
 def _mean(cells: list[Cell], condition: str, metric: str) -> float:
@@ -641,9 +653,12 @@ FIGURES = (
 )
 
 
-def _render(figure: Figure, title: str, identity: dict[str, str], format_name: str) -> bytes:
+def _render(figure: Figure, title: str, source: FigureInput, format_name: str) -> bytes:
     target = io.BytesIO()
-    description = f"{identity['experiment_id']} {identity['experiment_version']}"
+    description = (
+        f"{source.identity['experiment_id']} {source.identity['experiment_version']}; "
+        f"successful={len(source.cells)}; terminal={source.terminal_cells}"
+    )
     metadata: dict[str, Any]
     if format_name == "png":
         metadata = {
@@ -688,8 +703,8 @@ def figures(config_path: Path) -> tuple[dict[str, str], Path]:
     for stem, factory in FIGURES:
         figure, title, _summary = factory(source)
         try:
-            png = _render(figure, title, source.identity, "png")
-            pdf = _render(figure, title, source.identity, "pdf")
+            png = _render(figure, title, source, "png")
+            pdf = _render(figure, title, source, "pdf")
         finally:
             plt.close(figure)
         files[f"{stem}.png"] = png

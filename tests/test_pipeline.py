@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 import shutil
@@ -194,6 +195,39 @@ def test_external_tools_are_rejected_even_with_duplicate_native_ids() -> None:
     assert _forbidden_tool(web_search) == "web_search"
     assert _forbidden_tool(mcp) == "mcp_tool_call"
     assert _forbidden_tool(command) is None
+
+
+def test_figure_input_keeps_terminal_count_and_uses_successful_rows() -> None:
+    from repository_localization.figures import REQUIRED_COLUMNS, _cells
+
+    identity = {"experiment_id": "fixture", "experiment_version": "v1"}
+    rows = []
+    for cell_id, status in (("cell-000001", "succeeded"), ("cell-000002", "terminal")):
+        row = {column: "1" for column in REQUIRED_COLUMNS}
+        row.update(
+            {
+                **identity,
+                "cell_id": cell_id,
+                "task_id": "task-1",
+                "task_type": "EXPLICIT_LOCATOR_CLUE",
+                "condition": "NO-DOC",
+                "model": "fixture-model",
+                "reasoning_effort": "low",
+                "repeat": "1",
+                "status": status,
+            }
+        )
+        rows.append(row)
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=sorted(REQUIRED_COLUMNS), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+
+    cells, total, terminals = _cells(stream.getvalue().encode(), identity)
+
+    assert [cell.cell_id for cell in cells] == ["cell-000001"]
+    assert total == 2
+    assert terminals == 1
 
 
 def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
