@@ -19,7 +19,7 @@ CONDITIONS = (
     "OPTIONAL",
     "DOC-FIRST",
 )
-RUNNER_CONTRACT = "repository-localization-runner-v7"
+RUNNER_CONTRACT = "repository-localization-runner-v8"
 DATASET = {
     "name": "Contextbench/ContextBench",
     "config": "default",

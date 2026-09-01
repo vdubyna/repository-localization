@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from repository_localization.analysis import _has_explicit_gold_locator, _prompt_features
-from repository_localization.execution import _doc_first_valid
+from repository_localization.execution import _doc_first_valid, _forbidden_tool
 
 FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 
@@ -24,6 +24,7 @@ if [ "$1" = "--version" ]; then
 fi
 output=""
 schema=""
+search_disabled=0
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--output-last-message" ]; then
     shift
@@ -31,9 +32,14 @@ while [ "$#" -gt 0 ]; do
   elif [ "$1" = "--output-schema" ]; then
     shift
     schema="$1"
+  elif [ "$1" = 'web_search="disabled"' ]; then
+    search_disabled=1
   fi
   shift
 done
+if [ "$search_disabled" -ne 1 ]; then
+  exit 11
+fi
 if [ {exit_code} -ne 0 ]; then
   exit {exit_code}
 fi
@@ -175,6 +181,19 @@ def test_doc_first_requires_the_documentation_read_as_the_first_tool_call() -> N
     )
     assert _doc_first_valid(documentation, "docs/index.md")
     assert not _doc_first_valid(navigation + documentation, "docs/index.md")
+
+
+def test_external_tools_are_rejected_even_with_duplicate_native_ids() -> None:
+    web_search = (
+        b'{"type":"item.completed","item":{"id":"item-1","type":"web_search",'
+        b'"id":"exec-1","query":"upstream issue"}}\n'
+    )
+    mcp = b'{"type":"item.completed","item":{"type":"mcp_tool_call"}}\n'
+    command = b'{"type":"item.completed","item":{"type":"command_execution"}}\n'
+
+    assert _forbidden_tool(web_search) == "web_search"
+    assert _forbidden_tool(mcp) == "mcp_tool_call"
+    assert _forbidden_tool(command) is None
 
 
 def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
