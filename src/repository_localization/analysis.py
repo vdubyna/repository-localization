@@ -8,6 +8,7 @@ import io
 import re
 import unicodedata
 from collections import defaultdict
+from functools import lru_cache
 from math import log2
 from pathlib import Path
 from statistics import fmean
@@ -157,11 +158,17 @@ def _command_actions(payload: bytes) -> list[tuple[str, str]]:
 
 
 def _mentioned_paths(text: str, paths: Iterable[str]) -> set[str]:
-    return {
-        path
-        for path in paths
-        if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(path)}(?![A-Za-z0-9_./-])", text)
-    }
+    ordered = tuple(sorted(set(paths), key=lambda path: (-len(path), path)))
+    if not ordered:
+        return set()
+    pattern = _path_pattern(ordered)
+    return {match.group(0) for match in pattern.finditer(text)}
+
+
+@lru_cache(maxsize=64)
+def _path_pattern(paths: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(re.escape(path) for path in paths)
+    return re.compile(rf"(?<![A-Za-z0-9_.-])(?:{alternatives})(?![A-Za-z0-9_./-])")
 
 
 def _wiki_features(events: bytes, task: dict[str, Any]) -> dict[str, int]:
@@ -241,10 +248,59 @@ def _read_features(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]
     allowed = required | {"cell_features.csv", "task_features.csv"}
     if not required.issubset(payloads) or not set(payloads).issubset(allowed):
         raise IntegrityError("features artifact set is invalid")
-    expected = _feature_rows(config, plan, _durable_runs(config, plan))
-    if payloads["data.jsonl"] != b"".join(canonical(row) for row in expected):
-        raise IntegrityError("features do not match run evidence")
-    return expected
+    raw, rows = _jsonl(config.root / "features" / "data.jsonl", "feature data JSONL")
+    if raw != b"".join(canonical(row) for row in rows):
+        raise IntegrityError("feature data JSONL is not canonical")
+    if len(rows) != len(plan["cells"]):
+        raise IntegrityError("feature rows do not cover the frozen plan")
+    tasks = _task_map(plan)
+    expected_identity = identity(plan)
+    expected_keys = {
+        "schema_version",
+        *expected_identity,
+        "prompt_has_path",
+        "prompt_has_filename",
+        "prompt_has_symbol",
+        "wiki_read_count",
+        "wiki_tokens",
+        "unique_wiki_pages",
+        "beyond_entry_reads",
+        "cell_id",
+        "task_id",
+        "repository",
+        "condition",
+        "model",
+        "reasoning_effort",
+        "repeat",
+        "status",
+        "terminal_reason",
+        "files",
+        "provider_total_tokens",
+        "elapsed_seconds",
+        "agent_step_count",
+    }
+    for row, cell in zip(rows, plan["cells"], strict=True):
+        task = tasks[cell["task_id"]]
+        if (
+            set(row) != expected_keys
+            or row.get("schema_version") != 1
+            or any(row.get(key) != value for key, value in expected_identity.items())
+            or any(
+                row.get(key) != cell[key]
+                for key in (
+                    "cell_id",
+                    "task_id",
+                    "condition",
+                    "model",
+                    "reasoning_effort",
+                    "repeat",
+                )
+            )
+            or row.get("repository") != task["repository"]
+            or row.get("status") not in {"succeeded", "terminal"}
+        ):
+            raise IntegrityError("feature row does not match the frozen plan")
+    return rows
 
 
 def _load_gold(config: Config, plan: dict[str, Any]) -> dict[str, list[str]]:
@@ -571,5 +627,5 @@ def report(config_path: Path) -> tuple[dict[str, str], Path]:
         }
     )
     root = config.root / "report"
-    _publish(root, {"data.json": data})
+    _write_once(root / "data.json", data)
     return identity(plan), root / "data.json"

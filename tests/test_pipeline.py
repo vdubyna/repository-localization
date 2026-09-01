@@ -380,6 +380,9 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     (fixture / "source").rename(fixture / "source.hidden")
     reported = invoke(config, "report")
     assert reported.returncode == 0, reported.stdout + reported.stderr
+    (root / "report" / "figures").mkdir()
+    repeated_report = invoke(config, "report")
+    assert repeated_report.returncode == 0, repeated_report.stdout + repeated_report.stderr
     report_data = json.loads((root / "report" / "data.json").read_text())
     assert {key: report_data[key] for key in identity} == identity
     assert report_data["dataset"] == plan["dataset"]
