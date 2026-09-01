@@ -314,12 +314,10 @@ def _axis_decimal(value: float, _: float) -> str:
 
 def _finish(figure: Figure, title: str, identity: dict[str, str]) -> None:
     figure.suptitle(title, fontsize=13, fontweight="bold")
-    figure.text(
-        0.995,
-        0.004,
+    figure.supxlabel(
         f"{identity['experiment_id']} · {identity['experiment_version']}",
+        x=0.995,
         ha="right",
-        va="bottom",
         fontsize=6.5,
         color="#64748b",
     )
