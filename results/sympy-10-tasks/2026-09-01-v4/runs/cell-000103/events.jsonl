@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a05e4f-da1a-7e20-87d7-8e748875ebac"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"files\":[\"sympy/core/symbol.py\"]}"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"files\":[\"sympy/core/symbol.py\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":11133,"cached_input_tokens":6912,"output_tokens":45,"reasoning_output_tokens":0}}

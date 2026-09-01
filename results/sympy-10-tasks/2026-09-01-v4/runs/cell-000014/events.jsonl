@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a05e44-0244-7b52-940c-25382610132b"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"files\":[\"sympy/parsing/latex/_parse_latex_antlr.py\",\"sympy/parsing/latex/LaTeX.g4\"]}"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"files\":[\"sympy/parsing/latex/_parse_latex_antlr.py\",\"sympy/parsing/latex/LaTeX.g4\"]}"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"files\":[\"sympy/parsing/latex/_parse_latex_antlr.py\",\"sympy/parsing/latex/LaTeX.g4\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":11338,"cached_input_tokens":0,"output_tokens":227,"reasoning_output_tokens":98}}
