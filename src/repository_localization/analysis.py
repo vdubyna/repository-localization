@@ -8,6 +8,7 @@ import io
 import re
 import unicodedata
 from collections import defaultdict
+from functools import lru_cache
 from math import log2
 from pathlib import Path
 from statistics import fmean
@@ -21,23 +22,20 @@ from repository_localization.core import (
     IntegrityError,
     PipelineError,
     StateError,
-    _absolute,
     _files,
     _jsonl,
     _paths,
     _publish,
     _read_file,
     _safe_id,
-    _schema_one,
     _table,
     _write_once,
     canonical,
-    digest,
     load_config,
     strict_json,
 )
 from repository_localization.execution import _runs
-from repository_localization.planning import _current, _read_plan, _task_map, identity
+from repository_localization.planning import _current, _git_blob, _read_plan, _task_map, identity
 
 _PATH = re.compile(r"(?<![A-Za-z0-9_./-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?![A-Za-z0-9_./-])")
 _FILENAME = re.compile(
@@ -55,7 +53,6 @@ TASK_TYPES = ("EXPLICIT_LOCATOR_CLUE", "NO_EXPLICIT_LOCATOR_CLUE")
 CELL_COLUMNS = (
     "experiment_id",
     "experiment_version",
-    "plan_id",
     "cell_id",
     "task_id",
     "repository",
@@ -135,34 +132,12 @@ def _prompt_features(prompt: str) -> dict[str, bool]:
     }
 
 
-def _task_source_roots(config: Config) -> dict[str, Path]:
-    _, rows = _jsonl(config.tasks, "tasks JSONL")
-    result: dict[str, Path] = {}
-    keys = {
-        "task_id",
-        "repository",
-        "base_commit",
-        "prompt",
-        "source_root",
-        "documentation_entry",
-    }
-    for number, row in enumerate(rows, 1):
-        row = _table(row, f"tasks row {number}", keys)
-        task_id = _safe_id(row["task_id"], f"tasks row {number} task_id")
-        result[task_id] = _absolute(config.path.parent, row["source_root"], "source_root")
-    return result
-
-
 def _durable_runs(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]:
     runs = _runs(config.root, plan)
     ordered = [runs.get(cell["cell_id"]) for cell in plan["cells"]]
     if any(row is None for row in ordered):
         raise StateError("all planned cells must have a durable outcome before features")
     return ordered  # type: ignore[return-value]
-
-
-def _manifest(plan: dict[str, Any], checksum: str) -> dict[str, Any]:
-    return {"schema_version": 1, **identity(plan), "data_checksum": checksum}
 
 
 def _command_actions(payload: bytes) -> list[tuple[str, str]]:
@@ -183,11 +158,17 @@ def _command_actions(payload: bytes) -> list[tuple[str, str]]:
 
 
 def _mentioned_paths(text: str, paths: Iterable[str]) -> set[str]:
-    return {
-        path
-        for path in paths
-        if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(path)}(?![A-Za-z0-9_./-])", text)
-    }
+    ordered = tuple(sorted(set(paths), key=lambda path: (-len(path), path)))
+    if not ordered:
+        return set()
+    pattern = _path_pattern(ordered)
+    return {match.group(0) for match in pattern.finditer(text)}
+
+
+@lru_cache(maxsize=64)
+def _path_pattern(paths: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(re.escape(path) for path in paths)
+    return re.compile(rf"(?<![A-Za-z0-9_.-])(?:{alternatives})(?![A-Za-z0-9_./-])")
 
 
 def _wiki_features(events: bytes, task: dict[str, Any]) -> dict[str, int]:
@@ -257,30 +238,73 @@ def features(config_path: Path) -> tuple[dict[str, str], Path]:
         if _read_features(config, plan) != rows:
             raise IntegrityError("features do not match run evidence")
     else:
-        _publish(
-            root,
-            {"manifest.json": canonical(_manifest(plan, digest(data))), "data.jsonl": data},
-        )
+        _publish(root, {"data.jsonl": data})
     return identity(plan), root / "data.jsonl"
 
 
 def _read_features(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]:
     payloads = _files(config.root / "features")
-    required = {"manifest.json", "data.jsonl"}
+    required = {"data.jsonl"}
     allowed = required | {"cell_features.csv", "task_features.csv"}
     if not required.issubset(payloads) or not set(payloads).issubset(allowed):
         raise IntegrityError("features artifact set is invalid")
-    manifest = strict_json(payloads["manifest.json"], "features manifest")
-    if manifest != _manifest(plan, digest(payloads["data.jsonl"])):
-        raise IntegrityError("features identity is invalid")
-    expected = _feature_rows(config, plan, _durable_runs(config, plan))
-    if payloads["data.jsonl"] != b"".join(canonical(row) for row in expected):
-        raise IntegrityError("features do not match run evidence")
-    return expected
+    raw, rows = _jsonl(config.root / "features" / "data.jsonl", "feature data JSONL")
+    if raw != b"".join(canonical(row) for row in rows):
+        raise IntegrityError("feature data JSONL is not canonical")
+    if len(rows) != len(plan["cells"]):
+        raise IntegrityError("feature rows do not cover the frozen plan")
+    tasks = _task_map(plan)
+    expected_identity = identity(plan)
+    expected_keys = {
+        "schema_version",
+        *expected_identity,
+        "prompt_has_path",
+        "prompt_has_filename",
+        "prompt_has_symbol",
+        "wiki_read_count",
+        "wiki_tokens",
+        "unique_wiki_pages",
+        "beyond_entry_reads",
+        "cell_id",
+        "task_id",
+        "repository",
+        "condition",
+        "model",
+        "reasoning_effort",
+        "repeat",
+        "status",
+        "terminal_reason",
+        "files",
+        "provider_total_tokens",
+        "elapsed_seconds",
+        "agent_step_count",
+    }
+    for row, cell in zip(rows, plan["cells"], strict=True):
+        task = tasks[cell["task_id"]]
+        if (
+            set(row) != expected_keys
+            or row.get("schema_version") != 1
+            or any(row.get(key) != value for key, value in expected_identity.items())
+            or any(
+                row.get(key) != cell[key]
+                for key in (
+                    "cell_id",
+                    "task_id",
+                    "condition",
+                    "model",
+                    "reasoning_effort",
+                    "repeat",
+                )
+            )
+            or row.get("repository") != task["repository"]
+            or row.get("status") not in {"succeeded", "terminal"}
+        ):
+            raise IntegrityError("feature row does not match the frozen plan")
+    return rows
 
 
-def _load_gold(config: Config, plan: dict[str, Any]) -> tuple[bytes, dict[str, list[str]]]:
-    raw, rows = _jsonl(config.gold, "gold JSONL")
+def _load_gold(config: Config, plan: dict[str, Any]) -> dict[str, list[str]]:
+    _, rows = _jsonl(config.gold, "gold JSONL")
     source_files = {
         task["task_id"]: set(task["source_files"]) - set(task["documentation"]["paths"])
         for task in plan["tasks"]
@@ -300,13 +324,12 @@ def _load_gold(config: Config, plan: dict[str, Any]) -> tuple[bytes, dict[str, l
         if unknown:
             raise PipelineError(f"gold contains files outside the frozen source tree: {unknown}")
         result[task_id] = files
-    return raw, result
+    return result
 
 
-def _python_symbols(path: Path) -> set[str]:
-    if path.suffix not in {".py", ".pyi"}:
+def _python_symbols(path: str, payload: bytes) -> set[str]:
+    if Path(path).suffix not in {".py", ".pyi"}:
         return set()
-    payload = _read_file(path, "gold source file")
     try:
         tree = ast.parse(payload, filename=str(path))
     except (SyntaxError, ValueError):
@@ -318,7 +341,11 @@ def _python_symbols(path: Path) -> set[str]:
     }
 
 
-def _has_explicit_gold_locator(prompt: str, gold_files: list[str], source_root: Path) -> bool:
+def _has_explicit_gold_locator(
+    prompt: str,
+    gold_files: list[str],
+    read_source: Any,
+) -> bool:
     locators = _prompt_locators(prompt)
     for relative in gold_files:
         path = Path(relative)
@@ -327,7 +354,7 @@ def _has_explicit_gold_locator(prompt: str, gold_files: list[str], source_root: 
             or _normalized(path.name) in locators["filenames"]
         ):
             return True
-        if _python_symbols(source_root / path).intersection(locators["symbols"]):
+        if _python_symbols(relative, read_source(relative)).intersection(locators["symbols"]):
             return True
     return False
 
@@ -432,7 +459,6 @@ def _task_columns() -> tuple[str, ...]:
     columns = [
         "experiment_id",
         "experiment_version",
-        "plan_id",
         "task_id",
         "repository",
         "task_type",
@@ -476,15 +502,20 @@ def _aggregates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def analyze(config_path: Path) -> tuple[dict[str, str], Path]:
     config, plan = _current(config_path)
     features_rows = _read_features(config, plan)
-    gold_raw, gold = _load_gold(config, plan)
+    gold = _load_gold(config, plan)
     if set(gold) != {task["task_id"] for task in plan["tasks"]}:
         raise PipelineError("gold task coverage must exactly match public tasks")
-    source_roots = _task_source_roots(config)
     tasks = _task_map(plan)
     task_types = {
         task_id: (
             "EXPLICIT_LOCATOR_CLUE"
-            if _has_explicit_gold_locator(tasks[task_id]["prompt"], files, source_roots[task_id])
+            if _has_explicit_gold_locator(
+                tasks[task_id]["prompt"],
+                files,
+                lambda path, task=tasks[task_id]: _git_blob(
+                    Path(task["repository_path"]), task["base_commit"], path
+                ),
+            )
             else "NO_EXPLICIT_LOCATOR_CLUE"
         )
         for task_id, files in gold.items()
@@ -527,30 +558,24 @@ def analyze(config_path: Path) -> tuple[dict[str, str], Path]:
     analysis = {
         "schema_version": 1,
         **identity(plan),
-        "gold_checksum": digest(gold_raw),
-        "features_checksum": digest(b"".join(canonical(row) for row in features_rows)),
-        "cell_features_checksum": digest(cell_csv),
-        "task_features_checksum": digest(task_csv),
         "rows": rows,
         "task_rows": tasks_rows,
         "aggregates": _aggregates(rows),
     }
-    data = canonical(analysis)
     root = config.root / "analysis"
-    _publish(root, {"manifest.json": canonical(_manifest(plan, digest(data))), "data.json": data})
+    _publish(root, {"data.json": canonical(analysis)})
     return identity(plan), root / "data.json"
 
 
 def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
     payloads = _files(config.root / "analysis")
-    if set(payloads) != {"manifest.json", "data.json"}:
+    if set(payloads) != {"data.json"}:
         raise IntegrityError("analysis artifact set is invalid")
-    manifest = strict_json(payloads["manifest.json"], "analysis manifest")
     analysis = strict_json(payloads["data.json"], "analysis")
-    if manifest != _manifest(plan, digest(payloads["data.json"])) or not isinstance(analysis, dict):
-        raise IntegrityError("analysis manifest is invalid")
-    if not _schema_one(analysis.get("schema_version")) or any(
-        analysis.get(key) != value for key, value in identity(plan).items()
+    if (
+        not isinstance(analysis, dict)
+        or analysis.get("schema_version") != 1
+        or any(analysis.get(key) != value for key, value in identity(plan).items())
     ):
         raise IntegrityError("analysis identity is invalid")
     rows = analysis.get("rows")
@@ -578,16 +603,10 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
         cell_csv != _csv_bytes(CELL_COLUMNS, rows)
         or task_csv != _csv_bytes(_task_columns(), task_rows)
         or task_rows != _task_rows(plan, rows)
-        or analysis.get("cell_features_checksum") != digest(cell_csv)
-        or analysis.get("task_features_checksum") != digest(task_csv)
         or analysis.get("aggregates") != _aggregates(rows)
     ):
         raise IntegrityError("analysis tables do not match analysis data")
-    feature_rows = _read_features(config, plan)
-    if analysis.get("features_checksum") != digest(
-        b"".join(canonical(row) for row in feature_rows)
-    ):
-        raise IntegrityError("analysis does not match persisted features")
+    _read_features(config, plan)
     return analysis
 
 
@@ -600,7 +619,6 @@ def report(config_path: Path) -> tuple[dict[str, str], Path]:
             "schema_version": 1,
             **identity(plan),
             "dataset": plan["dataset"],
-            "source_checksum": digest(canonical(analysis)),
             "cell_features": "features/cell_features.csv",
             "task_features": "features/task_features.csv",
             "rows": analysis["rows"],
@@ -609,5 +627,5 @@ def report(config_path: Path) -> tuple[dict[str, str], Path]:
         }
     )
     root = config.root / "report"
-    _publish(root, {"manifest.json": canonical(_manifest(plan, digest(data))), "data.json": data})
+    _write_once(root / "data.json", data)
     return identity(plan), root / "data.json"

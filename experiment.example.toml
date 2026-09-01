@@ -8,11 +8,16 @@ tasks = "tasks.jsonl"
 gold = "protected/gold.jsonl"
 dataset_revision = "c2855792b006af41c67202d33883fb9d46362853"
 
+[[repositories]]
+name = "sympy/sympy"
+path = ".local/repositories/sympy.git"
+
 [design]
 repeats = 1
 
 [runner]
 binary = "/absolute/path/to/codex"
+parallelism = 8
 timeout_seconds = 900
 
 [[runner.profiles]]
