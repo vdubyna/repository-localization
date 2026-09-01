@@ -1,4 +1,4 @@
-"""Derive features, score predictions, and render the notebook report."""
+"""Derive features, score predictions, and publish EDA data."""
 
 from __future__ import annotations
 
@@ -418,72 +418,23 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
     return analysis
 
 
-# Notebook report
+# EDA data
 
 
 def report(config_path: Path) -> tuple[dict[str, str], Path]:
     config = load_config(config_path)
     plan = _read_plan(config)
     analysis = _read_analysis(config, plan)
-
-    def metric(value: float | None) -> str:
-        return "—" if value is None else f"{value:.3f}"
-
-    summary = [
-        f"# Experiment {plan['experiment_id']} {plan['experiment_version']}",
-        "",
-        f"Plan: `{plan['plan_id']}`",
-        f"Dataset: `{plan['dataset']['name']}@{plan['dataset']['revision']}` "
-        f"(`{plan['dataset']['config']}/{plan['dataset']['split']}`)",
-        "",
-        "| Condition | Planned | Succeeded | Terminal | Recall@3 | nDCG@3 | "
-        "Returned-set F1 | Recall@5 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in analysis["aggregates"]:
-        summary.append(
-            f"| {row['condition']} | {row['planned_observations']} | "
-            f"{row['successful_observations']} | {row['terminal_observations']} | "
-            f"{metric(row['mean_recall_at_3'])} | {metric(row['mean_ndcg_at_3'])} | "
-            f"{metric(row['mean_returned_set_f1'])} | {metric(row['mean_recall_at_5'])} |"
-        )
-    summary.append("")
-    notebook = {
-        "cells": [
-            {
-                "cell_type": "markdown",
-                "metadata": {},
-                "source": [f"{line}\n" for line in summary],
-            },
-            {
-                "cell_type": "code",
-                "execution_count": None,
-                "metadata": {},
-                "outputs": [],
-                "source": [
-                    "import json\n",
-                    "from pathlib import Path\n",
-                    "\n",
-                    "analysis = json.loads(Path('../analysis/data.json').read_text())\n",
-                    "analysis['aggregates']\n",
-                ],
-            },
-        ],
-        "metadata": {
-            "experiment": {**identity(plan), "dataset": plan["dataset"]},
-            "kernelspec": {
-                "display_name": "Python 3",
-                "language": "python",
-                "name": "python3",
-            },
-            "language_info": {"name": "python", "version": "3.13"},
-        },
-        "nbformat": 4,
-        "nbformat_minor": 5,
-    }
-    data = canonical(notebook)
-    root = config.root / "report"
-    _publish(
-        root, {"manifest.json": canonical(_manifest(plan, digest(data))), "report.ipynb": data}
+    data = canonical(
+        {
+            "schema_version": 1,
+            **identity(plan),
+            "dataset": plan["dataset"],
+            "source_checksum": digest(canonical(analysis)),
+            "rows": analysis["rows"],
+            "aggregates": analysis["aggregates"],
+        }
     )
-    return identity(plan), root / "report.ipynb"
+    root = config.root / "report"
+    _publish(root, {"manifest.json": canonical(_manifest(plan, digest(data))), "data.json": data})
+    return identity(plan), root / "data.json"

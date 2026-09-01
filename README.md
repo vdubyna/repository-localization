@@ -15,7 +15,7 @@ repository-localization report
 - `run` запускає Codex у трьох режимах роботи з документацією;
 - `features` перетворює сирі події запусків на таблицю спостережень;
 - `analyze` вперше відкриває захищені правильні відповіді та обчислює метрики;
-- `report` будує Jupyter Notebook (`.ipynb`) лише з уже перевіреного аналізу.
+- `report` формує стабільний `report/data.json` для спільного EDA notebook.
 
 ## Структура коду
 
@@ -26,7 +26,8 @@ repository-localization report
 - `core.py` — TOML/JSON-контракти, валідація, checksum-и та безпечний запис артефактів;
 - `planning.py` — перевірка repository snapshots, побудова й заморожування плану;
 - `execution.py` — ізольований запуск клітинок і перевірка сирих Codex events;
-- `analysis.py` — `features`, відкриття gold на етапі `analyze` і створення notebook-звіту.
+- `analysis.py` — `features`, відкриття gold на етапі `analyze` і підготовка EDA-даних;
+- `analysis/eda.ipynb` — єдиний notebook для всіх експериментів.
 
 Для розуміння операторського шляху достатньо читати `cli.py`, а потім модуль потрібного етапу.
 
@@ -102,7 +103,10 @@ uv run repository-localization --help
 cp experiment.example.toml experiment.toml
 ```
 
-Повний контракт наведений один раз у [`experiment.example.toml`](experiment.example.toml).
+Повний контракт запуску наведений один раз у
+[`experiment.example.toml`](experiment.example.toml). Джерело даних для спільного notebook
+задається окремим малим [`eda.example.toml`](eda.example.toml), щоб не змінювати вже заморожений
+`experiment.toml`.
 
 `dataset_revision` — повний Git commit набору ContextBench, з якого зовні підготовлено вибірку.
 `experiment_version` задає оператор. Вона записується в усі артефакти запуску. `prepare` також
@@ -167,6 +171,7 @@ snapshots і результати випадково не потрапляють
 ```bash
 git switch -c experiment/<experiment-id>-<experiment-version>
 cp experiment.example.toml experiment.toml
+cp eda.example.toml eda.toml
 # Підготуйте experiment.toml, tasks.jsonl, protected/gold.jsonl і локальні source_root.
 
 git add -f experiment.toml tasks.jsonl
@@ -188,6 +193,18 @@ uv run repository-localization features experiment.toml
 uv run repository-localization analyze experiment.toml
 uv run repository-localization report experiment.toml
 ```
+
+`report` не копіює notebook у каталог результатів. Після його виконання відкрийте один спільний
+[`analysis/eda.ipynb`](analysis/eda.ipynb). Notebook читає шлях до `eda.toml` зі змінної
+`EDA_CONFIG` або використовує `eda.toml` у поточному каталозі:
+
+```bash
+EDA_CONFIG=eda.toml jupyter lab analysis/eda.ipynb
+```
+
+У `eda.toml` змінюється лише шлях до конфігурації експерименту. Корінь версованих артефактів
+обчислюється з `artifact_dir`, `experiment_id` та `experiment_version`; шлях `data`
+задається відносно цього кореня.
 
 Після завершення додайте створені артефакти другим окремим комітом:
 
@@ -226,7 +243,7 @@ Codex CLI тричі поспіль повідомляє про очікуван
     final-output.json
   features/{manifest.json,data.jsonl}
   analysis/{manifest.json,data.json}
-  report/{manifest.json,report.ipynb}
+  report/{manifest.json,data.json}
 ```
 
 `experiment_id`, `experiment_version` і `plan_id` записані в plan, claims, observations, похідні
