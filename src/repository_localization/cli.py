@@ -67,7 +67,6 @@ def main(argv: list[str] | None = None) -> int:
         return exc.exit_code
     print(f"experiment: {experiment['experiment_id']}")
     print(f"version: {experiment['experiment_version']}")
-    print(f"plan: {experiment['plan_id']}")
     print(f"artifact: {artifact}")
     return 0
 

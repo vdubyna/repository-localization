@@ -8,6 +8,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import tempfile
 import time
 from pathlib import Path
@@ -22,20 +23,17 @@ from repository_localization.core import (
     _files,
     _prediction,
     _publish,
-    _read_executable,
     _read_file,
     _schema_one,
     _write_once,
     canonical,
-    digest,
     strict_json,
 )
 from repository_localization.planning import (
     _cell_map,
     _current,
-    _inspect_tree,
+    _git,
     _task_map,
-    build_plan,
     identity,
 )
 
@@ -83,7 +81,6 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
     expected_identity = identity(plan)
     result: dict[str, dict[str, Any]] = {}
     names = {
-        "manifest.json",
         "observation.json",
         "events.jsonl",
         "stderr.log",
@@ -94,7 +91,6 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
             raise IntegrityError(f"run artifact set is invalid: {run_root}")
         payloads = _files(run_root)
         observation = strict_json(payloads["observation.json"], "observation")
-        manifest = strict_json(payloads["manifest.json"], "run manifest")
         if not isinstance(observation, dict) or run_root.name != observation.get("cell_id"):
             raise IntegrityError("observation identity is invalid")
         if not _schema_one(observation.get("schema_version")):
@@ -109,26 +105,6 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
             for key in ("task_id", "condition", "model", "reasoning_effort", "repeat")
         ):
             raise IntegrityError("observation does not match the plan")
-        expected_manifest = {
-            "schema_version": 1,
-            **identity(plan),
-            "cell_id": observation["cell_id"],
-            "observation_checksum": digest(payloads["observation.json"]),
-        }
-        if (
-            not isinstance(manifest, dict)
-            or not _schema_one(manifest.get("schema_version"))
-            or manifest != expected_manifest
-        ):
-            raise IntegrityError("observation checksum is invalid")
-        checksums = observation.get("checksums")
-        raw_names = {"events.jsonl", "stderr.log", "final-output.json"}
-        if (
-            not isinstance(checksums, dict)
-            or set(checksums) != raw_names
-            or any(checksums.get(name) != digest(payloads[name]) for name in raw_names)
-        ):
-            raise IntegrityError("run raw evidence checksum is invalid")
         duration = observation.get("duration_ms")
         if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
             raise IntegrityError("run duration is invalid")
@@ -145,7 +121,6 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "reasoning_output_tokens",
                 "tool_steps",
                 "duration_ms",
-                "checksums",
             }
             if set(observation) != expected_keys:
                 raise IntegrityError("successful observation shape is invalid")
@@ -167,7 +142,6 @@ def _runs(root: Path, plan: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 "files",
                 "terminal_reason",
                 "duration_ms",
-                "checksums",
             }
             if (
                 set(observation) != expected_keys
@@ -361,16 +335,46 @@ def _prompt(task: dict[str, Any]) -> str:
     )
 
 
-def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -> Evidence:
+def _materialize(
+    task: dict[str, Any],
+    condition: str,
+    base: Path,
+    repository: Path,
+) -> None:
+    if not base.exists():
+        base.mkdir(parents=True, mode=0o700)
+        archive = _git(
+            Path(task["repository_path"]),
+            "archive",
+            "--format=tar",
+            task["base_commit"],
+            label=f"{task['task_id']} archive",
+        )
+        with tempfile.NamedTemporaryFile(dir=base.parent, suffix=".tar") as handle:
+            handle.write(archive)
+            handle.flush()
+            with tarfile.open(handle.name, mode="r:") as bundle:
+                bundle.extractall(base, filter="data")
+    shutil.copytree(base, repository)
+    guidance = task["guidance"][condition]
+    if guidance is not None:
+        (repository / "AGENTS.md").write_text(guidance, encoding="utf-8")
+    for path in sorted(repository.rglob("*"), reverse=True):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise IntegrityError(f"materialized Git entry is unsafe: {path}")
+        executable = path.stat().st_mode & 0o111
+        path.chmod(0o555 if path.is_dir() or executable else 0o444)
+    repository.chmod(0o555)
+
+
+def _execute(
+    plan: dict[str, Any],
+    task: dict[str, Any],
+    cell: dict[str, Any],
+    repository: Path,
+) -> Evidence:
     runner = plan["runner"]
     binary = Path(runner["binary"])
-    binary_bytes, binary_runtime = _read_executable(binary)
-    if (
-        digest(binary_bytes) != runner["binary_checksum"]
-        or binary_runtime != runner["binary_runtime"]
-    ):
-        raise IntegrityError("Codex binary changed after prepare")
-    binding = task["source"]
     started = time.monotonic()
     events = b""
     stderr = b""
@@ -379,21 +383,6 @@ def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -
     try:
         with tempfile.TemporaryDirectory(prefix="repository-localization-cell-") as raw_temporary:
             temporary = Path(raw_temporary).resolve()
-            repository = temporary / "repository"
-            shutil.copytree(Path(binding["root"]), repository, symlinks=True)
-            copied, _ = _inspect_tree(repository, "source")
-            if any(
-                copied[key] != binding[key] for key in ("tree_checksum", "file_count", "byte_count")
-            ):
-                raise IntegrityError("copied source root differs from frozen plan")
-            guidance = task["guidance"][cell["condition"]]
-            if guidance is not None:
-                repository.chmod(0o755)
-                (repository / "AGENTS.md").write_text(guidance, encoding="utf-8")
-            for path in sorted(repository.rglob("*"), reverse=True):
-                executable = path.stat().st_mode & 0o111
-                path.chmod(0o555 if path.is_dir() or executable else 0o444)
-            repository.chmod(0o555)
             schema = temporary / "prediction-schema.json"
             output = temporary / "final-output.json"
             schema.write_bytes(
@@ -494,11 +483,6 @@ def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -
                         "files": files,
                         **observed_usage,
                         "duration_ms": int((time.monotonic() - started) * 1000),
-                        "checksums": {
-                            "events.jsonl": digest(events),
-                            "stderr.log": digest(stderr),
-                            "final-output.json": digest(final_output),
-                        },
                     }
                     return Evidence(observation, events, stderr, final_output)
     except OSError:
@@ -511,11 +495,6 @@ def _execute(plan: dict[str, Any], task: dict[str, Any], cell: dict[str, Any]) -
         "files": [],
         "terminal_reason": terminal_reason or "execution_failed",
         "duration_ms": int((time.monotonic() - started) * 1000),
-        "checksums": {
-            "events.jsonl": digest(events),
-            "stderr.log": digest(stderr),
-            "final-output.json": digest(final_output),
-        },
     }
     return Evidence(observation, events, stderr, final_output)
 
@@ -539,41 +518,43 @@ def run(config_path: Path, *, resume: bool) -> tuple[dict[str, str], Path]:
     tasks = _task_map(plan)
     if len(runs) < len(plan["cells"]):
         _credentials()
-    for ordinal, cell in enumerate(plan["cells"], 1):
-        if cell["cell_id"] in runs:
-            continue
-        print(
-            f"run {ordinal}/{len(plan['cells'])}: {cell['task_id']} {cell['condition']} "
-            f"{cell['model']}/{cell['reasoning_effort']}",
-            flush=True,
-        )
-        claim = {"schema_version": 1, **identity(plan), **cell}
-        claimed = _write_once(config.root / "claims" / f"{cell['cell_id']}.json", canonical(claim))
-        if not claimed:
-            raise StateError(f"cell {cell['cell_id']} was claimed by another runner")
-        evidence = _execute(plan, tasks[cell["task_id"]], cell)
-        _, after, _ = build_plan(config_path)
-        if after != plan:
-            raise IntegrityError("experiment inputs changed during Codex execution")
-        observation = canonical(evidence.observation)
-        _publish(
-            config.root / "runs" / cell["cell_id"],
-            {
-                "manifest.json": canonical(
-                    {
-                        "schema_version": 1,
-                        **identity(plan),
-                        "cell_id": cell["cell_id"],
-                        "observation_checksum": digest(observation),
-                    }
-                ),
-                "observation.json": observation,
-                "events.jsonl": evidence.events,
-                "stderr.log": evidence.stderr,
-                "final-output.json": evidence.final_output,
-            },
-        )
-        runs[cell["cell_id"]] = evidence.observation
+    with tempfile.TemporaryDirectory(prefix="repository-localization-run-") as raw_run:
+        run_root = Path(raw_run).resolve()
+        (run_root / "bases").mkdir()
+        (run_root / "workspaces").mkdir()
+        workspaces: dict[tuple[str, str], Path] = {}
+        for ordinal, cell in enumerate(plan["cells"], 1):
+            if cell["cell_id"] in runs:
+                continue
+            task = tasks[cell["task_id"]]
+            key = (cell["task_id"], cell["condition"])
+            if key not in workspaces:
+                base = run_root / "bases" / cell["task_id"]
+                repository = run_root / "workspaces" / f"{cell['task_id']}-{cell['condition']}"
+                _materialize(task, cell["condition"], base, repository)
+                workspaces[key] = repository
+            print(
+                f"run {ordinal}/{len(plan['cells'])}: {cell['task_id']} {cell['condition']} "
+                f"{cell['model']}/{cell['reasoning_effort']}",
+                flush=True,
+            )
+            claim = {"schema_version": 1, **identity(plan), **cell}
+            claimed = _write_once(
+                config.root / "claims" / f"{cell['cell_id']}.json", canonical(claim)
+            )
+            if not claimed:
+                raise StateError(f"cell {cell['cell_id']} was claimed by another runner")
+            evidence = _execute(plan, task, cell, workspaces[key])
+            _publish(
+                config.root / "runs" / cell["cell_id"],
+                {
+                    "observation.json": canonical(evidence.observation),
+                    "events.jsonl": evidence.events,
+                    "stderr.log": evidence.stderr,
+                    "final-output.json": evidence.final_output,
+                },
+            )
+            runs[cell["cell_id"]] = evidence.observation
     terminals = [
         f"{cell['cell_id']}:{runs[cell['cell_id']]['terminal_reason']}"
         for cell in plan["cells"]
