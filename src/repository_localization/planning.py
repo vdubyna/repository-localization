@@ -192,6 +192,7 @@ def build_plan(config_path: Path) -> tuple[Config, dict[str, Any], bytes]:
         "runner": {
             "binary": str(config.binary),
             "version": _executable_version(config.binary),
+            "parallelism": config.parallelism,
             "profiles": [profile.as_dict() for profile in config.profiles],
             "timeout_seconds": config.timeout_seconds,
         },

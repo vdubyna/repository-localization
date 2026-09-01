@@ -83,6 +83,7 @@ repeats = 1
 
 [runner]
 binary = "/absolute/path/to/native/codex"
+parallelism = 8
 timeout_seconds = 900
 
 [[runner.profiles]]
@@ -91,8 +92,11 @@ reasoning_effort = "medium"
 ```
 
 `runner.profiles` приймає від одного до восьми унікальних профілів. Повний приклад містить усі
-вісім профілів дослідження. `experiment_version` задається оператором і записується в plan, claims,
-observations, проміжні дані, обидві CSV та report.
+вісім профілів дослідження. `parallelism` задає від одного до восьми одночасних клітинок і
+записується у frozen plan; не змінюйте його в межах однієї версії експерименту. Паралельний запуск
+скорочує wall-clock час, але `elapsed_seconds` включає конкуренцію за локальні ресурси.
+`experiment_version` задається оператором і записується в plan, claims, observations, проміжні
+дані, обидві CSV та report.
 
 Codex executable має бути прямим native executable, а не shim менеджера версій. Для Volta це
 зазвичай файл `vendor/aarch64-apple-darwin/bin/codex` усередині встановленого пакета.
