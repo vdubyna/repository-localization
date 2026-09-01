@@ -12,6 +12,7 @@ from repository_localization.core import (
     CONDITIONS,
     DATASET,
     RUNNER_CONTRACT,
+    WIKI_TOKENIZER,
     Config,
     IntegrityError,
     PipelineError,
@@ -159,6 +160,16 @@ def _load_tasks(config: Config) -> tuple[bytes, list[dict[str, Any]]]:
         )
         if documentation_entry is None or documentation_entry["bytes"] == 0:
             raise PipelineError(f"{task_id}: documentation_entry is missing or empty")
+        documentation_parent = PurePosixPath(entry_path).parent
+        if documentation_parent == PurePosixPath("."):
+            documentation_paths = [entry_path]
+        else:
+            prefix = f"{documentation_parent.as_posix()}/"
+            documentation_paths = [
+                entry["path"]
+                for entry in entries
+                if entry["type"] == "file" and entry["path"].startswith(prefix)
+            ]
         tasks.append(
             {
                 "task_id": task_id,
@@ -172,6 +183,7 @@ def _load_tasks(config: Config) -> tuple[bytes, list[dict[str, Any]]]:
                     "entry_path": entry_path,
                     "entry_checksum": documentation_entry["sha256"],
                     "entry_bytes": documentation_entry["bytes"],
+                    "paths": documentation_paths,
                 },
                 "guidance": {
                     condition: _guidance(condition, entry_path) for condition in CONDITIONS
@@ -188,6 +200,7 @@ def build_plan(config_path: Path) -> tuple[Config, dict[str, Any], bytes]:
     cells: list[dict[str, Any]] = []
     seed = {
         "runner_contract": RUNNER_CONTRACT,
+        "wiki_tokenizer": WIKI_TOKENIZER,
         "experiment_id": config.experiment_id,
         "experiment_version": config.experiment_version,
         "dataset": {**DATASET, "revision": config.dataset_revision},
@@ -198,33 +211,28 @@ def build_plan(config_path: Path) -> tuple[Config, dict[str, Any], bytes]:
             "binary": str(config.binary),
             "binary_checksum": digest(binary),
             "binary_runtime": binary_runtime,
-            "model": config.model,
-            "reasoning_effort": config.reasoning_effort,
+            "profiles": [profile.as_dict() for profile in config.profiles],
             "timeout_seconds": config.timeout_seconds,
         },
         "repeats": config.repeats,
     }
     seed_checksum = digest(canonical(seed))
     for task in tasks:
-        for repeat in range(1, config.repeats + 1):
-            for condition in CONDITIONS:
-                cells.append(
-                    {
-                        "cell_id": digest(
-                            canonical(
-                                {
-                                    "seed": seed_checksum,
-                                    "task_id": task["task_id"],
-                                    "condition": condition,
-                                    "repeat": repeat,
-                                }
-                            )
-                        ),
+        for profile in config.profiles:
+            for repeat in range(1, config.repeats + 1):
+                for condition in CONDITIONS:
+                    body = {
                         "task_id": task["task_id"],
                         "condition": condition,
+                        **profile.as_dict(),
                         "repeat": repeat,
                     }
-                )
+                    cells.append(
+                        {
+                            "cell_id": digest(canonical({"seed": seed_checksum, **body})),
+                            **body,
+                        }
+                    )
     body = {
         "schema_version": 1,
         "experiment_id": config.experiment_id,
@@ -235,6 +243,7 @@ def build_plan(config_path: Path) -> tuple[Config, dict[str, Any], bytes]:
         "tasks_path": str(config.tasks),
         "tasks_checksum": digest(tasks_raw),
         "runner_contract": RUNNER_CONTRACT,
+        "wiki_tokenizer": seed["wiki_tokenizer"],
         "runner": seed["runner"],
         "conditions": list(CONDITIONS),
         "repeats": config.repeats,

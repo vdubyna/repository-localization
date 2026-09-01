@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from repository_localization.analysis import _gold_locator_mentioned, _prompt_features
+from repository_localization.analysis import _has_explicit_gold_locator, _prompt_features
 
 FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 
@@ -49,8 +49,28 @@ if [ ! -x pkg/service.py ]; then
 fi
 if [ -f AGENTS.md ]; then
   files='["pkg/service.py"]'
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"docs/index.md",'\
+'"aggregated_output":"documentation\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"docs/guide.md",'\
+'"aggregated_output":"service guide\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"rg greeting pkg",'\
+'"aggregated_output":"pkg/service.py:1:def greeting():\\n"}}}}'
+  printf '%s\n' "$event"
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"pkg/service.py",'\
+'"aggregated_output":"def greeting():\\n"}}}}'
+  printf '%s\n' "$event"
 else
   files='["pkg/readme.py"]'
+  event='{{"type":"item.completed",'\
+'"item":{{"type":"command_execution","command":"pkg/readme.py",'\
+'"aggregated_output":"pkg/readme.py\\n"}}}}'
+  printf '%s\n' "$event"
 fi
 printf '{{"files":%s}}\n' "$files" > "$output"
 printf '%s\n' '{{"type":"thread.started"}}'
@@ -104,8 +124,26 @@ def test_task_locator_features_are_explicit_and_gold_aware(tmp_path: Path) -> No
     source = tmp_path / "pkg"
     source.mkdir()
     (source / "service.py").write_text("def greeting():\n    return 'hello'\n")
-    assert _gold_locator_mentioned("Fix `greeting`.", ["pkg/service.py"], tmp_path)
-    assert not _gold_locator_mentioned("Fix unrelated behavior.", ["pkg/service.py"], tmp_path)
+    assert _has_explicit_gold_locator("Fix `greeting`.", ["pkg/service.py"], tmp_path)
+    assert not _has_explicit_gold_locator("Fix unrelated behavior.", ["pkg/service.py"], tmp_path)
+
+
+def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
+    fixture, config = setup(tmp_path)
+    profiles = "".join(
+        f'\n[[runner.profiles]]\nmodel = "fixture-{number}"\nreasoning_effort = "high"\n'
+        for number in range(3, 9)
+    )
+    config.write_text(config.read_text(encoding="utf-8") + profiles, encoding="utf-8")
+
+    prepared = invoke(config, "prepare")
+
+    assert prepared.returncode == 0, prepared.stdout + prepared.stderr
+    plan = json.loads(
+        (fixture / "artifacts" / "fixture-localization" / "v1" / "plan.json").read_text()
+    )
+    assert len(plan["runner"]["profiles"]) == 8
+    assert len(plan["cells"]) == 24
 
 
 def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None:
@@ -149,7 +187,7 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     assert all(row["prompt_has_path"] for row in feature_rows)
     assert all(row["prompt_has_filename"] for row in feature_rows)
     assert all(row["prompt_has_symbol"] for row in feature_rows)
-    assert all("gold_locator_mentioned" not in row for row in feature_rows)
+    assert all("task_type" not in row for row in feature_rows)
 
     hidden_gold.rename(gold)
 
@@ -181,19 +219,35 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         "revision": "c2855792b006af41c67202d33883fb9d46362853",
     }
     assert plan["tasks"][0]["guidance"]["NO-DOC"] is None
+    assert plan["tasks"][0]["documentation"]["paths"] == ["docs/guide.md", "docs/index.md"]
     assert plan["tasks"][0]["base_commit"] == "0123456789abcdef0123456789abcdef01234567"
+    assert plan["runner"]["profiles"] == [
+        {"model": "fixture-model", "reasoning_effort": "low"},
+        {"model": "fixture-model", "reasoning_effort": "medium"},
+    ]
     assert "You may consult" in plan["tasks"][0]["guidance"]["OPTIONAL"]
     assert "Before searching" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
     assert [row["mean_recall_at_5"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_recall_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_ndcg_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_returned_set_f1"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
-    assert [row["successful_observations"] for row in analysis["aggregates"]] == [1, 1, 1]
+    assert [row["successful_observations"] for row in analysis["aggregates"]] == [2, 2, 2]
     assert [row["terminal_observations"] for row in analysis["aggregates"]] == [0, 0, 0]
-    assert all(row["prompt_has_path"] for row in analysis["rows"])
-    assert all(row["prompt_has_filename"] for row in analysis["rows"])
-    assert all(row["prompt_has_symbol"] for row in analysis["rows"])
-    assert all(row["gold_locator_mentioned"] for row in analysis["rows"])
+    assert all(row["task_type"] == "EXPLICIT_LOCATOR_CLUE" for row in analysis["rows"])
+    assert [row["wiki_read_count"] for row in analysis["rows"]] == [0, 2, 2, 0, 2, 2]
+    assert [row["unique_wiki_pages"] for row in analysis["rows"]] == [0, 2, 2, 0, 2, 2]
+    assert [row["beyond_entry_reads"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert all(row["wiki_tokens"] > 0 for row in analysis["rows"] if row["condition"] != "NO-DOC")
+    assert [row["gold_seen_any"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert [row["gold_seen_by_3_source_actions"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    assert [row["gold_targeted_any"] for row in analysis["rows"]] == [0, 1, 1, 0, 1, 1]
+    with (root / "features" / "cell_features.csv").open(newline="") as handle:
+        cell_rows = list(csv.DictReader(handle))
+    with (root / "features" / "task_features.csv").open(newline="") as handle:
+        task_rows = list(csv.DictReader(handle))
+    assert len(cell_rows) == 6
+    assert len(task_rows) == 1
+    assert task_rows[0]["doc_first_minus_optional_recall_at_3"] == "0.0"
     json_artifacts = [
         *sorted((root / "claims").glob("*.json")),
         *sorted((root / "runs").glob("*/manifest.json")),
@@ -232,6 +286,10 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         line for cell in shared_eda["cells"] for line in cell.get("source", [])
     )
     assert "EXPERIMENT_CONFIG" in notebook_source
+    assert "features/cell_features.csv" in notebook_source
+    assert "features/task_features.csv" in notebook_source
+    assert "report/data.json" not in notebook_source
+    assert "build_focused_research_report" not in notebook_source
 
 
 def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
@@ -275,13 +333,17 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     fieldnames = [
+        "experiment_id",
+        "experiment_version",
+        "plan_id",
         "cell_id",
-        "safe_task_id",
+        "task_id",
         "task_type",
         "condition",
         "model",
         "reasoning_effort",
         "repeat",
+        "status",
         "recall_at_3",
         "recall_at_5",
         "ndcg_at_3",
@@ -293,7 +355,7 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
         "gold_seen_by_3_source_actions",
         "gold_targeted_any",
     ]
-    conditions = ["NO_DOC_GUIDANCE", "FUNCTIONAL_OPTIONAL", "FUNCTIONAL_REQUIRED_BEFORE_SOURCE"]
+    conditions = ["NO-DOC", "OPTIONAL", "DOC-FIRST"]
     with (feature_root / "cell_features.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -307,13 +369,17 @@ def test_report_generates_versioned_research_figures(tmp_path: Path) -> None:
                     quality = 0.45 + 0.05 * task_index + 0.02 * condition_index
                     writer.writerow(
                         {
+                            "experiment_id": experiment_id,
+                            "experiment_version": experiment_version,
+                            "plan_id": plan_id,
                             "cell_id": f"cell-{task_index}-{profile_index}-{condition_index}",
-                            "safe_task_id": f"task-{task_index}",
+                            "task_id": f"task-{task_index}",
                             "task_type": task_type,
                             "condition": condition,
                             "model": model,
                             "reasoning_effort": effort,
                             "repeat": 1,
+                            "status": "succeeded",
                             "recall_at_3": quality,
                             "recall_at_5": quality + 0.02,
                             "ndcg_at_3": quality + 0.01,
@@ -375,24 +441,25 @@ def test_multiple_tasks_in_one_repository_are_isolated(tmp_path: Path) -> None:
         json.loads(line) for line in (root / "features" / "data.jsonl").read_text().splitlines()
     ]
     assert len(plan["tasks"]) == 2
-    assert len(plan["cells"]) == 6
-    assert len({cell["cell_id"] for cell in plan["cells"]}) == 6
-    assert len(list((root / "claims").glob("*.json"))) == 6
-    assert len(list((root / "runs").glob("*/observation.json"))) == 6
-    assert len(features) == 6
+    assert len(plan["cells"]) == 12
+    assert len({cell["cell_id"] for cell in plan["cells"]}) == 12
+    assert len(list((root / "claims").glob("*.json"))) == 12
+    assert len(list((root / "runs").glob("*/observation.json"))) == 12
+    assert len(features) == 12
     assert all(
-        sum(row["task_id"] == task["task_id"] for row in features) == 3 for task in plan["tasks"]
+        sum(row["task_id"] == task["task_id"] for row in features) == 6 for task in plan["tasks"]
     )
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     by_task = {
         task["task_id"]: [row for row in analysis["rows"] if row["task_id"] == task["task_id"]]
         for task in plan["tasks"]
     }
-    assert all(row["gold_locator_mentioned"] for row in by_task[first_task["task_id"]])
-    assert all(not row["gold_locator_mentioned"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_path"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_filename"] for row in by_task[second_task["task_id"]])
-    assert all(not row["prompt_has_symbol"] for row in by_task[second_task["task_id"]])
+    assert all(
+        row["task_type"] == "EXPLICIT_LOCATOR_CLUE" for row in by_task[first_task["task_id"]]
+    )
+    assert all(
+        row["task_type"] == "NO_EXPLICIT_LOCATOR_CLUE" for row in by_task[second_task["task_id"]]
+    )
 
 
 def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
@@ -428,15 +495,15 @@ def test_version_drift_resume_terminal_and_help(tmp_path: Path) -> None:
     terminal = invoke(config, "run")
     assert terminal.returncode == 5
     root = fixture / "artifacts" / "fixture-localization" / "v1"
-    assert len(list((root / "runs").glob("*/observation.json"))) == 3
+    assert len(list((root / "runs").glob("*/observation.json"))) == 6
     retried = invoke(config, "run", "--resume")
     assert retried.returncode == 5
-    assert "3 terminal cell(s)" in retried.stdout
+    assert "6 terminal cell(s)" in retried.stdout
     assert invoke(config, "features").returncode == 0
     assert invoke(config, "analyze").returncode == 0
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     assert [row["successful_observations"] for row in analysis["aggregates"]] == [0, 0, 0]
-    assert [row["terminal_observations"] for row in analysis["aggregates"]] == [1, 1, 1]
+    assert [row["terminal_observations"] for row in analysis["aggregates"]] == [2, 2, 2]
     assert all(row["mean_recall_at_3"] is None for row in analysis["aggregates"])
     assert invoke(config, "report").returncode == 0
 

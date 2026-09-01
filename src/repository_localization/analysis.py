@@ -1,17 +1,21 @@
-"""Derive features, score predictions, and publish EDA data."""
+"""Extract public evidence, add gold-aware features, and publish analysis tables."""
 
 from __future__ import annotations
 
 import ast
+import csv
+import io
 import re
 import unicodedata
+from collections import defaultdict
 from math import log2
 from pathlib import Path
 from statistics import fmean
-from typing import Any
+from typing import Any, Iterable
+
+import tiktoken
 
 from repository_localization.core import (
-    _SHA256,
     CONDITIONS,
     Config,
     IntegrityError,
@@ -26,6 +30,7 @@ from repository_localization.core import (
     _safe_id,
     _schema_one,
     _table,
+    _write_once,
     canonical,
     digest,
     load_config,
@@ -34,18 +39,70 @@ from repository_localization.core import (
 from repository_localization.execution import _runs
 from repository_localization.planning import _current, _read_plan, _task_map, identity
 
-# Feature extraction from durable run evidence
-
 _PATH = re.compile(r"(?<![A-Za-z0-9_./-])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+(?![A-Za-z0-9_./-])")
 _FILENAME = re.compile(
     r"(?<![A-Za-z0-9_.-])[A-Za-z0-9_-]+\."
-    r"(?:cfg|css|html?|ini|ipynb|js|json|md|pyi?|rst|sh|toml|ts|txt|ya?ml)"
+    r"(?:cfg|css|html?|ini|ipynb|js|json|md|mdx|pyi?|rst|sh|toml|ts|txt|ya?ml)"
     r"(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 _BACKTICK_SYMBOL = re.compile(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)`")
 _CALL_SYMBOL = re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _WORD = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_WIKI_ENCODING = tiktoken.get_encoding("o200k_base")
+
+TASK_TYPES = ("EXPLICIT_LOCATOR_CLUE", "NO_EXPLICIT_LOCATOR_CLUE")
+CELL_COLUMNS = (
+    "experiment_id",
+    "experiment_version",
+    "plan_id",
+    "cell_id",
+    "task_id",
+    "repository",
+    "task_type",
+    "condition",
+    "model",
+    "reasoning_effort",
+    "repeat",
+    "status",
+    "terminal_reason",
+    "recall_at_3",
+    "recall_at_5",
+    "ndcg_at_3",
+    "returned_set_f1",
+    "provider_total_tokens",
+    "elapsed_seconds",
+    "agent_step_count",
+    "wiki_read_count",
+    "wiki_tokens",
+    "unique_wiki_pages",
+    "beyond_entry_reads",
+    "gold_seen_any",
+    "gold_seen_by_3_source_actions",
+    "gold_targeted_any",
+)
+TASK_METRICS = (
+    "recall_at_3",
+    "recall_at_5",
+    "ndcg_at_3",
+    "returned_set_f1",
+    "provider_total_tokens",
+    "elapsed_seconds",
+    "agent_step_count",
+    "wiki_read_count",
+    "wiki_tokens",
+    "unique_wiki_pages",
+    "beyond_entry_reads",
+    "gold_seen_any",
+    "gold_seen_by_3_source_actions",
+    "gold_targeted_any",
+)
+_CONDITION_SLUGS = {"NO-DOC": "no_doc", "OPTIONAL": "optional", "DOC-FIRST": "doc_first"}
+_CONTRASTS = (
+    ("doc_first_minus_optional", "DOC-FIRST", "OPTIONAL"),
+    ("doc_first_minus_no_doc", "DOC-FIRST", "NO-DOC"),
+    ("optional_minus_no_doc", "OPTIONAL", "NO-DOC"),
+)
 
 
 def _normalized(value: str) -> str:
@@ -108,58 +165,116 @@ def _manifest(plan: dict[str, Any], checksum: str) -> dict[str, Any]:
     return {"schema_version": 1, **identity(plan), "data_checksum": checksum}
 
 
-def _feature_rows(plan: dict[str, Any], runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    repositories = {task["task_id"]: task["repository"] for task in plan["tasks"]}
-    task_features = {task["task_id"]: _prompt_features(task["prompt"]) for task in plan["tasks"]}
-    return [
-        {
-            "schema_version": 1,
-            **identity(plan),
-            **task_features[row["task_id"]],
-            "cell_id": row["cell_id"],
-            "task_id": row["task_id"],
-            "repository": repositories[row["task_id"]],
-            "condition": row["condition"],
-            "repeat": row["repeat"],
-            "status": row["status"],
-            "terminal_reason": row.get("terminal_reason"),
-            "files": row["files"],
-            "input_tokens": row.get("input_tokens"),
-            "cached_input_tokens": row.get("cached_input_tokens"),
-            "output_tokens": row.get("output_tokens"),
-            "reasoning_output_tokens": row.get("reasoning_output_tokens"),
-            "tool_steps": row.get("tool_steps"),
-            "duration_ms": row["duration_ms"],
-        }
-        for row in runs
-    ]
+def _command_actions(payload: bytes) -> list[tuple[str, str]]:
+    actions: list[tuple[str, str]] = []
+    for number, line in enumerate(payload.splitlines(), 1):
+        event = strict_json(line, f"Codex event {number}")
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        output = item.get("aggregated_output", "")
+        if not isinstance(command, str) or not isinstance(output, str):
+            raise IntegrityError("Codex command event has invalid command or output")
+        actions.append((command, output))
+    return actions
+
+
+def _mentioned_paths(text: str, paths: Iterable[str]) -> set[str]:
+    return {
+        path
+        for path in paths
+        if re.search(rf"(?<![A-Za-z0-9_.-]){re.escape(path)}(?![A-Za-z0-9_./-])", text)
+    }
+
+
+def _wiki_features(events: bytes, task: dict[str, Any]) -> dict[str, int]:
+    documentation = set(task["documentation"]["paths"])
+    source = set(task["source_files"]) - documentation
+    entry = task["documentation"]["entry_path"]
+    reads: list[tuple[set[str], str]] = []
+    for command, output in _command_actions(events):
+        documentation_paths = _mentioned_paths(command, documentation)
+        source_paths = _mentioned_paths(command, source)
+        if output and documentation_paths and not source_paths:
+            reads.append((documentation_paths, output))
+    pages = set().union(*(paths for paths, _ in reads)) if reads else set()
+    return {
+        "wiki_read_count": len(reads),
+        "wiki_tokens": sum(len(_WIKI_ENCODING.encode(output)) for _, output in reads),
+        "unique_wiki_pages": len(pages),
+        "beyond_entry_reads": sum(bool(paths - {entry}) for paths, _ in reads),
+    }
+
+
+def _feature_rows(
+    config: Config, plan: dict[str, Any], runs: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    tasks = _task_map(plan)
+    task_features = {task_id: _prompt_features(task["prompt"]) for task_id, task in tasks.items()}
+    rows: list[dict[str, Any]] = []
+    for run in runs:
+        task = tasks[run["task_id"]]
+        events = _read_file(config.root / "runs" / run["cell_id"] / "events.jsonl", "Codex events")
+        input_tokens = run.get("input_tokens")
+        output_tokens = run.get("output_tokens")
+        rows.append(
+            {
+                "schema_version": 1,
+                **identity(plan),
+                **task_features[run["task_id"]],
+                **_wiki_features(events, task),
+                "cell_id": run["cell_id"],
+                "task_id": run["task_id"],
+                "repository": task["repository"],
+                "condition": run["condition"],
+                "model": run["model"],
+                "reasoning_effort": run["reasoning_effort"],
+                "repeat": run["repeat"],
+                "status": run["status"],
+                "terminal_reason": run.get("terminal_reason"),
+                "files": run["files"],
+                "provider_total_tokens": (
+                    input_tokens + output_tokens
+                    if input_tokens is not None and output_tokens is not None
+                    else None
+                ),
+                "elapsed_seconds": run["duration_ms"] / 1000,
+                "agent_step_count": run.get("tool_steps"),
+            }
+        )
+    return rows
 
 
 def features(config_path: Path) -> tuple[dict[str, str], Path]:
     config, plan = _current(config_path)
-    rows = _feature_rows(plan, _durable_runs(config, plan))
+    rows = _feature_rows(config, plan, _durable_runs(config, plan))
     data = b"".join(canonical(row) for row in rows)
     root = config.root / "features"
-    _publish(root, {"manifest.json": canonical(_manifest(plan, digest(data))), "data.jsonl": data})
+    if root.exists():
+        if _read_features(config, plan) != rows:
+            raise IntegrityError("features do not match run evidence")
+    else:
+        _publish(
+            root,
+            {"manifest.json": canonical(_manifest(plan, digest(data))), "data.jsonl": data},
+        )
     return identity(plan), root / "data.jsonl"
 
 
 def _read_features(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]:
-    root = config.root / "features"
-    payloads = _files(root)
-    if set(payloads) != {"manifest.json", "data.jsonl"}:
+    payloads = _files(config.root / "features")
+    required = {"manifest.json", "data.jsonl"}
+    allowed = required | {"cell_features.csv", "task_features.csv"}
+    if not required.issubset(payloads) or not set(payloads).issubset(allowed):
         raise IntegrityError("features artifact set is invalid")
     manifest = strict_json(payloads["manifest.json"], "features manifest")
-    expected_manifest = _manifest(plan, digest(payloads["data.jsonl"]))
-    if (
-        not isinstance(manifest, dict)
-        or not _schema_one(manifest.get("schema_version"))
-        or manifest != expected_manifest
-    ):
+    if manifest != _manifest(plan, digest(payloads["data.jsonl"])):
         raise IntegrityError("features identity is invalid")
-    expected = _feature_rows(plan, _durable_runs(config, plan))
-    expected_data = b"".join(canonical(row) for row in expected)
-    if payloads["data.jsonl"] != expected_data:
+    expected = _feature_rows(config, plan, _durable_runs(config, plan))
+    if payloads["data.jsonl"] != b"".join(canonical(row) for row in expected):
         raise IntegrityError("features do not match run evidence")
     return expected
 
@@ -167,7 +282,7 @@ def _read_features(config: Config, plan: dict[str, Any]) -> list[dict[str, Any]]
 def _load_gold(config: Config, plan: dict[str, Any]) -> tuple[bytes, dict[str, list[str]]]:
     raw, rows = _jsonl(config.gold, "gold JSONL")
     source_files = {
-        task["task_id"]: set(task["source_files"]) - {task["documentation"]["entry_path"]}
+        task["task_id"]: set(task["source_files"]) - set(task["documentation"]["paths"])
         for task in plan["tasks"]
     }
     result: dict[str, list[str]] = {}
@@ -203,7 +318,7 @@ def _python_symbols(path: Path) -> set[str]:
     }
 
 
-def _gold_locator_mentioned(prompt: str, gold_files: list[str], source_root: Path) -> bool:
+def _has_explicit_gold_locator(prompt: str, gold_files: list[str], source_root: Path) -> bool:
     locators = _prompt_locators(prompt)
     for relative in gold_files:
         path = Path(relative)
@@ -217,116 +332,208 @@ def _gold_locator_mentioned(prompt: str, gold_files: list[str], source_root: Pat
     return False
 
 
-def _gold_locator_mentions(
-    config: Config, plan: dict[str, Any], gold: dict[str, list[str]]
-) -> dict[str, bool]:
-    source_roots = _task_source_roots(config)
+def _trajectory(events: bytes, task: dict[str, Any], gold: list[str]) -> dict[str, int]:
+    documentation = set(task["documentation"]["paths"])
+    source = set(task["source_files"]) - documentation
+    gold_set = set(gold)
+    source_action = 0
+    seen_any = False
+    seen_by_three = False
+    targeted = False
+    for command, output in _command_actions(events):
+        documentation_paths = _mentioned_paths(command, documentation)
+        source_paths = _mentioned_paths(command, source)
+        if documentation_paths and not source_paths:
+            continue
+        source_action += 1
+        seen = bool(_mentioned_paths(output, gold_set))
+        seen_any = seen_any or seen
+        seen_by_three = seen_by_three or (source_action <= 3 and seen)
+        targeted = targeted or bool(_mentioned_paths(command, gold_set))
     return {
-        task["task_id"]: _gold_locator_mentioned(
-            task["prompt"], gold[task["task_id"]], source_roots[task["task_id"]]
-        )
-        for task in plan["tasks"]
+        "gold_seen_any": int(seen_any),
+        "gold_seen_by_3_source_actions": int(seen_by_three),
+        "gold_targeted_any": int(targeted),
     }
 
 
-# Gold-aware metrics
+def _score(feature: dict[str, Any], gold_files: list[str]) -> dict[str, Any]:
+    if feature["status"] == "terminal":
+        return {
+            "recall_at_3": None,
+            "recall_at_5": None,
+            "ndcg_at_3": None,
+            "returned_set_f1": None,
+        }
+    gold = set(gold_files)
+    predictions = feature["files"]
+    relevance = [path in gold for path in predictions[:3]]
+    matched_at_3 = sum(relevance)
+    matched_at_5 = len(gold.intersection(predictions))
+    ideal = sum(1 / log2(rank + 1) for rank in range(1, min(3, len(gold)) + 1))
+    actual = sum(int(value) / log2(rank + 1) for rank, value in enumerate(relevance, 1))
+    return {
+        "recall_at_3": matched_at_3 / len(gold),
+        "recall_at_5": matched_at_5 / len(gold),
+        "ndcg_at_3": actual / ideal,
+        "returned_set_f1": 2 * matched_at_5 / (len(predictions) + len(gold)),
+    }
+
+
+def _csv_bytes(columns: Iterable[str], rows: Iterable[dict[str, Any]]) -> bytes:
+    stream = io.StringIO(newline="")
+    fieldnames = list(columns)
+    writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: row.get(key) for key in fieldnames})
+    return stream.getvalue().encode("utf-8")
+
+
+def _task_rows(plan: dict[str, Any], rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row["status"] == "succeeded":
+            grouped[row["task_id"], row["condition"]].append(row)
+    result: list[dict[str, Any]] = []
+    for task in plan["tasks"]:
+        task_id = task["task_id"]
+        task_types = {row["task_type"] for row in rows if row["task_id"] == task_id}
+        if len(task_types) != 1:
+            raise IntegrityError(f"task_type is inconsistent for task {task_id}")
+        row: dict[str, Any] = {
+            **identity(plan),
+            "task_id": task_id,
+            "repository": task["repository"],
+            "task_type": task_types.pop(),
+        }
+        means: dict[tuple[str, str], float | None] = {}
+        for condition in CONDITIONS:
+            selected = grouped[task_id, condition]
+            for metric in TASK_METRICS:
+                values = [value for item in selected if (value := item[metric]) is not None]
+                mean = fmean(values) if values else None
+                means[condition, metric] = mean
+                row[f"{_CONDITION_SLUGS[condition]}_mean_{metric}"] = mean
+        for prefix, left, right in _CONTRASTS:
+            for metric in TASK_METRICS:
+                left_value = means[left, metric]
+                right_value = means[right, metric]
+                row[f"{prefix}_{metric}"] = (
+                    left_value - right_value
+                    if left_value is not None and right_value is not None
+                    else None
+                )
+        result.append(row)
+    return result
+
+
+def _task_columns() -> tuple[str, ...]:
+    columns = [
+        "experiment_id",
+        "experiment_version",
+        "plan_id",
+        "task_id",
+        "repository",
+        "task_type",
+    ]
+    columns.extend(
+        f"{_CONDITION_SLUGS[condition]}_mean_{metric}"
+        for condition in CONDITIONS
+        for metric in TASK_METRICS
+    )
+    columns.extend(f"{prefix}_{metric}" for prefix, _, _ in _CONTRASTS for metric in TASK_METRICS)
+    return tuple(columns)
+
+
+def _aggregates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result = []
+    for condition in CONDITIONS:
+        selected = [row for row in rows if row["condition"] == condition]
+        succeeded = [row for row in selected if row["status"] == "succeeded"]
+        result.append(
+            {
+                "condition": condition,
+                "planned_observations": len(selected),
+                "successful_observations": len(succeeded),
+                "terminal_observations": len(selected) - len(succeeded),
+                **{
+                    f"mean_{metric}": (
+                        fmean(row[metric] for row in succeeded) if succeeded else None
+                    )
+                    for metric in (
+                        "recall_at_3",
+                        "recall_at_5",
+                        "ndcg_at_3",
+                        "returned_set_f1",
+                    )
+                },
+            }
+        )
+    return result
 
 
 def analyze(config_path: Path) -> tuple[dict[str, str], Path]:
     config, plan = _current(config_path)
-    feature_rows = _read_features(config, plan)
+    features_rows = _read_features(config, plan)
     gold_raw, gold = _load_gold(config, plan)
-    expected_tasks = {task["task_id"] for task in plan["tasks"]}
-    if set(gold) != expected_tasks:
+    if set(gold) != {task["task_id"] for task in plan["tasks"]}:
         raise PipelineError("gold task coverage must exactly match public tasks")
-    gold_mentions = _gold_locator_mentions(config, plan, gold)
+    source_roots = _task_source_roots(config)
+    tasks = _task_map(plan)
+    task_types = {
+        task_id: (
+            "EXPLICIT_LOCATOR_CLUE"
+            if _has_explicit_gold_locator(tasks[task_id]["prompt"], files, source_roots[task_id])
+            else "NO_EXPLICIT_LOCATOR_CLUE"
+        )
+        for task_id, files in gold.items()
+    }
     rows: list[dict[str, Any]] = []
-    for feature in feature_rows:
-        gold_files = set(gold[feature["task_id"]])
-        common = {
-            **identity(plan),
-            "prompt_has_path": feature["prompt_has_path"],
-            "prompt_has_filename": feature["prompt_has_filename"],
-            "prompt_has_symbol": feature["prompt_has_symbol"],
-            "gold_locator_mentioned": gold_mentions[feature["task_id"]],
-            "cell_id": feature["cell_id"],
-            "task_id": feature["task_id"],
-            "repository": feature["repository"],
-            "condition": feature["condition"],
-            "repeat": feature["repeat"],
-            "status": feature["status"],
-            "terminal_reason": feature["terminal_reason"],
-            "gold_file_count": len(gold_files),
-            "input_tokens": feature["input_tokens"],
-            "output_tokens": feature["output_tokens"],
-            "tool_steps": feature["tool_steps"],
-            "duration_ms": feature["duration_ms"],
-        }
-        if feature["status"] == "terminal":
-            rows.append(
-                {
-                    **common,
-                    "relevance_at_3": [],
-                    "recall_at_3": None,
-                    "ndcg_at_3": None,
-                    "returned_set_f1": None,
-                    "recall_at_5": None,
-                    "matched_gold_at_3": 0,
-                    "matched_gold_at_5": 0,
-                    "predicted_file_count": 0,
-                }
-            )
-            continue
-        predictions = feature["files"]
-        relevance_at_3 = [path in gold_files for path in predictions[:3]]
-        matched_at_3 = sum(relevance_at_3)
-        matched_at_5 = len(gold_files.intersection(predictions))
-        ideal_dcg = sum(1 / log2(rank + 1) for rank in range(1, min(3, len(gold_files)) + 1))
-        dcg = sum(int(relevant) / log2(rank + 1) for rank, relevant in enumerate(relevance_at_3, 1))
+    for feature in features_rows:
+        task_id = feature["task_id"]
+        events = _read_file(
+            config.root / "runs" / feature["cell_id"] / "events.jsonl", "Codex events"
+        )
         rows.append(
             {
-                **common,
-                "relevance_at_3": relevance_at_3,
-                "recall_at_3": matched_at_3 / len(gold_files),
-                "ndcg_at_3": dcg / ideal_dcg,
-                "returned_set_f1": 2 * matched_at_5 / (len(predictions) + len(gold_files)),
-                "recall_at_5": matched_at_5 / len(gold_files),
-                "matched_gold_at_3": matched_at_3,
-                "matched_gold_at_5": matched_at_5,
-                "predicted_file_count": len(predictions),
+                **identity(plan),
+                "cell_id": feature["cell_id"],
+                "task_id": task_id,
+                "repository": feature["repository"],
+                "task_type": task_types[task_id],
+                "condition": feature["condition"],
+                "model": feature["model"],
+                "reasoning_effort": feature["reasoning_effort"],
+                "repeat": feature["repeat"],
+                "status": feature["status"],
+                "terminal_reason": feature["terminal_reason"],
+                **_score(feature, gold[task_id]),
+                "provider_total_tokens": feature["provider_total_tokens"],
+                "elapsed_seconds": feature["elapsed_seconds"],
+                "agent_step_count": feature["agent_step_count"],
+                "wiki_read_count": feature["wiki_read_count"],
+                "wiki_tokens": feature["wiki_tokens"],
+                "unique_wiki_pages": feature["unique_wiki_pages"],
+                "beyond_entry_reads": feature["beyond_entry_reads"],
+                **_trajectory(events, tasks[task_id], gold[task_id]),
             }
         )
-    aggregates = []
-    for condition in CONDITIONS:
-        condition_rows = [row for row in rows if row["condition"] == condition]
-        succeeded = [row for row in condition_rows if row["status"] == "succeeded"]
-        aggregates.append(
-            {
-                "condition": condition,
-                "planned_observations": len(condition_rows),
-                "successful_observations": len(succeeded),
-                "terminal_observations": len(condition_rows) - len(succeeded),
-                "mean_recall_at_3": (
-                    fmean(row["recall_at_3"] for row in succeeded) if succeeded else None
-                ),
-                "mean_ndcg_at_3": (
-                    fmean(row["ndcg_at_3"] for row in succeeded) if succeeded else None
-                ),
-                "mean_returned_set_f1": (
-                    fmean(row["returned_set_f1"] for row in succeeded) if succeeded else None
-                ),
-                "mean_recall_at_5": (
-                    fmean(row["recall_at_5"] for row in succeeded) if succeeded else None
-                ),
-            }
-        )
+    tasks_rows = _task_rows(plan, rows)
+    cell_csv = _csv_bytes(CELL_COLUMNS, rows)
+    task_csv = _csv_bytes(_task_columns(), tasks_rows)
+    _write_once(config.root / "features" / "cell_features.csv", cell_csv)
+    _write_once(config.root / "features" / "task_features.csv", task_csv)
     analysis = {
         "schema_version": 1,
         **identity(plan),
         "gold_checksum": digest(gold_raw),
-        "features_checksum": digest(b"".join(canonical(row) for row in feature_rows)),
+        "features_checksum": digest(b"".join(canonical(row) for row in features_rows)),
+        "cell_features_checksum": digest(cell_csv),
+        "task_features_checksum": digest(task_csv),
         "rows": rows,
-        "aggregates": aggregates,
+        "task_rows": tasks_rows,
+        "aggregates": _aggregates(rows),
     }
     data = canonical(analysis)
     root = config.root / "analysis"
@@ -340,217 +547,48 @@ def _read_analysis(config: Config, plan: dict[str, Any]) -> dict[str, Any]:
         raise IntegrityError("analysis artifact set is invalid")
     manifest = strict_json(payloads["manifest.json"], "analysis manifest")
     analysis = strict_json(payloads["data.json"], "analysis")
-    if not isinstance(manifest, dict) or not isinstance(analysis, dict):
-        raise IntegrityError("analysis is invalid")
-    if not _schema_one(manifest.get("schema_version")) or manifest != _manifest(
-        plan, digest(payloads["data.json"])
-    ):
+    if manifest != _manifest(plan, digest(payloads["data.json"])) or not isinstance(analysis, dict):
         raise IntegrityError("analysis manifest is invalid")
-    expected_analysis_keys = {
-        "schema_version",
-        *identity(plan),
-        "gold_checksum",
-        "features_checksum",
-        "rows",
-        "aggregates",
-    }
-    gold_checksum = analysis.get("gold_checksum")
-    features_checksum = analysis.get("features_checksum")
-    if (
-        set(analysis) != expected_analysis_keys
-        or not _schema_one(analysis.get("schema_version"))
-        or any(analysis.get(key) != value for key, value in identity(plan).items())
-        or not isinstance(gold_checksum, str)
-        or _SHA256.fullmatch(gold_checksum) is None
-        or not isinstance(features_checksum, str)
-        or _SHA256.fullmatch(features_checksum) is None
+    if not _schema_one(analysis.get("schema_version")) or any(
+        analysis.get(key) != value for key, value in identity(plan).items()
     ):
         raise IntegrityError("analysis identity is invalid")
-    feature_rows = _read_features(config, plan)
-    if features_checksum != digest(b"".join(canonical(row) for row in feature_rows)):
-        raise IntegrityError("analysis does not match persisted features")
     rows = analysis.get("rows")
-    aggregates = analysis.get("aggregates")
-    if (
-        not isinstance(rows, list)
-        or not isinstance(aggregates, list)
-        or len(rows) != len(plan["cells"])
-        or len(aggregates) != len(CONDITIONS)
-    ):
+    task_rows = analysis.get("task_rows")
+    if not isinstance(rows, list) or len(rows) != len(plan["cells"]):
         raise IntegrityError("analysis rows are invalid")
-    row_keys = {
-        *identity(plan),
-        "prompt_has_path",
-        "prompt_has_filename",
-        "prompt_has_symbol",
-        "gold_locator_mentioned",
-        "cell_id",
-        "task_id",
-        "repository",
-        "condition",
-        "repeat",
-        "status",
-        "terminal_reason",
-        "relevance_at_3",
-        "recall_at_3",
-        "ndcg_at_3",
-        "returned_set_f1",
-        "recall_at_5",
-        "gold_file_count",
-        "matched_gold_at_3",
-        "matched_gold_at_5",
-        "predicted_file_count",
-        "input_tokens",
-        "output_tokens",
-        "tool_steps",
-        "duration_ms",
-    }
-    tasks = _task_map(plan)
-    gold_counts: dict[str, int] = {}
-    gold_mentions: dict[str, bool] = {}
-    for row, cell, feature in zip(rows, plan["cells"], feature_rows, strict=True):
-        if not isinstance(row, dict) or set(row) != row_keys:
-            raise IntegrityError("analysis row shape is invalid")
-        if (
-            any(row.get(key) != value for key, value in identity(plan).items())
-            or any(
-                row.get(key) != cell[key] for key in ("cell_id", "task_id", "condition", "repeat")
+    if not isinstance(task_rows, list) or len(task_rows) != len(plan["tasks"]):
+        raise IntegrityError("analysis task rows are invalid")
+    for row, cell in zip(rows, plan["cells"], strict=True):
+        if not isinstance(row, dict) or any(
+            row.get(key) != cell[key]
+            for key in (
+                "cell_id",
+                "task_id",
+                "condition",
+                "model",
+                "reasoning_effort",
+                "repeat",
             )
-            or row.get("repository") != tasks[cell["task_id"]]["repository"]
-            or row.get("status") != feature["status"]
-            or row.get("terminal_reason") != feature["terminal_reason"]
         ):
             raise IntegrityError("analysis row does not match the plan")
-        prompt_feature_keys = (
-            "prompt_has_path",
-            "prompt_has_filename",
-            "prompt_has_symbol",
-        )
-        if (
-            any(row[key] != feature[key] for key in prompt_feature_keys)
-            or type(row["gold_locator_mentioned"]) is not bool
-        ):
-            raise IntegrityError("analysis locator features are invalid")
-        gold_count = row["gold_file_count"]
-        matched_at_3 = row["matched_gold_at_3"]
-        matched_at_5 = row["matched_gold_at_5"]
-        predicted_count = row["predicted_file_count"]
-        if (
-            any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in (gold_count, matched_at_3, matched_at_5, predicted_count)
-            )
-            or gold_count < 1
-        ):
-            raise IntegrityError("analysis row counts are invalid")
-        if predicted_count != len(feature["files"]) or any(
-            row[key] != feature[key]
-            for key in ("input_tokens", "output_tokens", "tool_steps", "duration_ms")
-        ):
-            raise IntegrityError("analysis row does not match persisted features")
-        previous_gold_count = gold_counts.setdefault(row["task_id"], gold_count)
-        if previous_gold_count != gold_count:
-            raise IntegrityError("analysis gold count is inconsistent")
-        previous_gold_mention = gold_mentions.setdefault(
-            row["task_id"], row["gold_locator_mentioned"]
-        )
-        if previous_gold_mention != row["gold_locator_mentioned"]:
-            raise IntegrityError("analysis gold locator feature is inconsistent")
-        relevance = row["relevance_at_3"]
-        if row["status"] == "terminal":
-            if (
-                not isinstance(row["terminal_reason"], str)
-                or not row["terminal_reason"]
-                or matched_at_3 != 0
-                or matched_at_5 != 0
-                or predicted_count != 0
-                or relevance != []
-                or any(
-                    row[key] is not None
-                    for key in (
-                        "recall_at_3",
-                        "ndcg_at_3",
-                        "returned_set_f1",
-                        "recall_at_5",
-                        "input_tokens",
-                        "output_tokens",
-                        "tool_steps",
-                    )
-                )
-            ):
-                raise IntegrityError("terminal analysis row is invalid")
-            duration = row["duration_ms"]
-            if isinstance(duration, bool) or not isinstance(duration, int) or duration < 0:
-                raise IntegrityError("analysis duration is invalid")
-            continue
-        if row["status"] != "succeeded" or row["terminal_reason"] is not None:
-            raise IntegrityError("analysis status is invalid")
-        if not (
-            0 <= matched_at_3 <= min(3, gold_count, predicted_count)
-            and matched_at_3 <= matched_at_5 <= min(gold_count, predicted_count)
-            and 1 <= predicted_count <= 5
-        ):
-            raise IntegrityError("successful analysis row counts are invalid")
-        if (
-            not isinstance(relevance, list)
-            or len(relevance) != min(3, predicted_count)
-            or any(type(value) is not bool for value in relevance)
-            or sum(relevance) != matched_at_3
-        ):
-            raise IntegrityError("analysis rank relevance is invalid")
-        ideal_dcg = sum(1 / log2(rank + 1) for rank in range(1, min(3, gold_count) + 1))
-        dcg = sum(int(relevant) / log2(rank + 1) for rank, relevant in enumerate(relevance, 1))
-        expected_metrics = {
-            "recall_at_3": matched_at_3 / gold_count,
-            "ndcg_at_3": dcg / ideal_dcg,
-            "returned_set_f1": 2 * matched_at_5 / (predicted_count + gold_count),
-            "recall_at_5": matched_at_5 / gold_count,
-        }
-        if any(
-            isinstance(row[key], bool) or not isinstance(row[key], int | float) or row[key] != value
-            for key, value in expected_metrics.items()
-        ):
-            raise IntegrityError("analysis row metric is invalid")
-        for key in ("input_tokens", "output_tokens"):
-            value = row[key]
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise IntegrityError("analysis token count is invalid")
-        for key in ("tool_steps", "duration_ms"):
-            value = row[key]
-            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise IntegrityError("analysis resource count is invalid")
-    expected_aggregates = []
-    for condition in CONDITIONS:
-        selected = [row for row in rows if row["condition"] == condition]
-        succeeded = [row for row in selected if row["status"] == "succeeded"]
-        expected_aggregates.append(
-            {
-                "condition": condition,
-                "planned_observations": len(selected),
-                "successful_observations": len(succeeded),
-                "terminal_observations": len(selected) - len(succeeded),
-                "mean_recall_at_3": (
-                    fmean(row["recall_at_3"] for row in succeeded) if succeeded else None
-                ),
-                "mean_ndcg_at_3": (
-                    fmean(row["ndcg_at_3"] for row in succeeded) if succeeded else None
-                ),
-                "mean_returned_set_f1": (
-                    fmean(row["returned_set_f1"] for row in succeeded) if succeeded else None
-                ),
-                "mean_recall_at_5": (
-                    fmean(row["recall_at_5"] for row in succeeded) if succeeded else None
-                ),
-            }
-        )
-    if aggregates != expected_aggregates:
-        raise IntegrityError("analysis aggregates are invalid")
+    cell_csv = _read_file(config.root / "features" / "cell_features.csv", "cell feature table")
+    task_csv = _read_file(config.root / "features" / "task_features.csv", "task feature table")
+    if (
+        cell_csv != _csv_bytes(CELL_COLUMNS, rows)
+        or task_csv != _csv_bytes(_task_columns(), task_rows)
+        or task_rows != _task_rows(plan, rows)
+        or analysis.get("cell_features_checksum") != digest(cell_csv)
+        or analysis.get("task_features_checksum") != digest(task_csv)
+        or analysis.get("aggregates") != _aggregates(rows)
+    ):
+        raise IntegrityError("analysis tables do not match analysis data")
+    feature_rows = _read_features(config, plan)
+    if analysis.get("features_checksum") != digest(
+        b"".join(canonical(row) for row in feature_rows)
+    ):
+        raise IntegrityError("analysis does not match persisted features")
     return analysis
-
-
-# EDA data
 
 
 def report(config_path: Path) -> tuple[dict[str, str], Path]:
@@ -563,7 +601,10 @@ def report(config_path: Path) -> tuple[dict[str, str], Path]:
             **identity(plan),
             "dataset": plan["dataset"],
             "source_checksum": digest(canonical(analysis)),
+            "cell_features": "features/cell_features.csv",
+            "task_features": "features/task_features.csv",
             "rows": analysis["rows"],
+            "task_rows": analysis["task_rows"],
             "aggregates": analysis["aggregates"],
         }
     )
