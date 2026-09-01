@@ -1,0 +1,18 @@
+schema_version = 1
+experiment_id = "fixture-localization"
+experiment_version = "v1"
+artifact_dir = "artifacts"
+
+[inputs]
+tasks = "tasks.jsonl"
+gold = "gold.jsonl"
+dataset_revision = "c2855792b006af41c67202d33883fb9d46362853"
+
+[design]
+repeats = 1
+
+[runner]
+binary = "/replaced/by/test"
+model = "fixture-model"
+reasoning_effort = "low"
+timeout_seconds = 30

@@ -1,0 +1,19 @@
+.DS_Store
+.venv/
+.local/
+.experiment/
+
+# Local experiment state. Keep it out of the software release by default.
+/experiment.toml
+/tasks.jsonl
+/protected/
+/sources/
+/experiments/
+/results/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
