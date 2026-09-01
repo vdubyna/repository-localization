@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a05b1a-581f-72b1-8e64-009a0fa5ec04"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"files\":[\"simpy/crypto/crypto.py\"]}"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"files\":[\"simpy/crypto/crypto.py\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":13876,"cached_input_tokens":9984,"cache_write_input_tokens":0,"output_tokens":65,"reasoning_output_tokens":15}}
