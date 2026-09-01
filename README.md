@@ -266,6 +266,21 @@ Notebook обчислює шлях до `report/data.json` із `artifact_dir`, 
 `experiment_version`. Тому конфігурація запуску й джерело EDA завжди описують одну версію
 експерименту.
 
+### Рисунки розділу 4
+
+Вісім окремих дослідницьких рисунків генеруються з таблиці
+`features/cell_features.csv` без повторного запуску провайдера:
+
+```bash
+uv run repository-localization report experiments/82-tasks/experiment-record.toml --figures
+```
+
+Команда записує PNG і PDF у
+`results/<experiment-id>/<experiment-version>/report/figures/`. `manifest.json` у цьому каталозі
+містить версію експерименту, `plan_id`, checksum вхідної таблиці, точні значення на рисунках і
+checksum кожного файла. Усі середні та різниці обчислюються з рядків запусків; у коді не
+захардкоджено значення з тексту дослідження. Bootstrap і довірчі інтервали не будуються.
+
 Після завершення додайте створені артефакти другим окремим комітом:
 
 ```bash
