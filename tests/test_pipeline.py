@@ -141,9 +141,9 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     analysis = json.loads((root / "analysis" / "data.json").read_text())
     assert {key: analysis[key] for key in identity} == identity
     assert plan["conditions"] == [
-        "NO_DOC_GUIDANCE",
-        "FUNCTIONAL_OPTIONAL",
-        "FUNCTIONAL_REQUIRED_BEFORE_SOURCE",
+        "NO-DOC",
+        "OPTIONAL",
+        "DOC-FIRST",
     ]
     assert plan["dataset"] == {
         "name": "Contextbench/ContextBench",
@@ -151,10 +151,10 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         "split": "train",
         "revision": "c2855792b006af41c67202d33883fb9d46362853",
     }
-    assert plan["tasks"][0]["guidance"]["NO_DOC_GUIDANCE"] is None
+    assert plan["tasks"][0]["guidance"]["NO-DOC"] is None
     assert plan["tasks"][0]["base_commit"] == "0123456789abcdef0123456789abcdef01234567"
-    assert "You may consult" in plan["tasks"][0]["guidance"]["FUNCTIONAL_OPTIONAL"]
-    assert "Before searching" in plan["tasks"][0]["guidance"]["FUNCTIONAL_REQUIRED_BEFORE_SOURCE"]
+    assert "You may consult" in plan["tasks"][0]["guidance"]["OPTIONAL"]
+    assert "Before searching" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
     assert [row["mean_recall_at_5"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_recall_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_ndcg_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
@@ -192,11 +192,8 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
     report = "".join(notebook["cells"][0]["source"])
     assert "# Experiment fixture-localization v1" in report
     assert plan["plan_id"] in report
-    assert "| FUNCTIONAL_OPTIONAL | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |" in report
-    assert (
-        "| FUNCTIONAL_REQUIRED_BEFORE_SOURCE | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |"
-        in report
-    )
+    assert "| OPTIONAL | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |" in report
+    assert "| DOC-FIRST | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 | 1.000 |" in report
     assert "../analysis/data.json" in "".join(notebook["cells"][1]["source"])
     report_manifest = json.loads((root / "report" / "manifest.json").read_text())
     assert {key: report_manifest[key] for key in identity} == identity

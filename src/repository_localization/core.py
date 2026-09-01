@@ -15,11 +15,11 @@ from typing import Any
 from uuid import uuid4
 
 CONDITIONS = (
-    "NO_DOC_GUIDANCE",
-    "FUNCTIONAL_OPTIONAL",
-    "FUNCTIONAL_REQUIRED_BEFORE_SOURCE",
+    "NO-DOC",
+    "OPTIONAL",
+    "DOC-FIRST",
 )
-RUNNER_CONTRACT = "repository-localization-runner-v3"
+RUNNER_CONTRACT = "repository-localization-runner-v4"
 DATASET = {
     "name": "Contextbench/ContextBench",
     "config": "default",

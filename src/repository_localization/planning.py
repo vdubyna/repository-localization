@@ -99,18 +99,18 @@ def _inspect_tree(root: Path, label: str) -> tuple[dict[str, Any], list[dict[str
 
 
 def _guidance(condition: str, entry_path: str) -> str | None:
-    if condition == "NO_DOC_GUIDANCE":
+    if condition == "NO-DOC":
         return None
     header = (
         "## Repository documentation\n\n"
         f"The repository's native functional documentation starts at `{entry_path}`.\n"
     )
-    if condition == "FUNCTIONAL_OPTIONAL":
+    if condition == "OPTIONAL":
         return header + (
             "You may consult it if it seems useful for locating the implementation files "
             "relevant to the task.\n"
         )
-    if condition == "FUNCTIONAL_REQUIRED_BEFORE_SOURCE":
+    if condition == "DOC-FIRST":
         return header + (
             "Before searching, listing, or reading source-code paths or contents, read this "
             "documentation entry. After that first documentation read, decide freely whether "
