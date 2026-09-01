@@ -13,8 +13,8 @@ repository-localization report
 
 - `prepare` перевіряє та заморожує всі відкриті входи;
 - `run` запускає Codex у трьох режимах роботи з документацією;
-- `features` перетворює сирі події запусків на таблицю спостережень;
-- `analyze` вперше відкриває захищені правильні відповіді та обчислює метрики;
+- `features` виділяє відкриті фічі prompt і перетворює сирі події на таблицю спостережень;
+- `analyze` вперше відкриває gold, додає gold-aware фічу та обчислює метрики;
 - `report` формує стабільний `report/data.json` для спільного EDA notebook.
 
 ## Структура коду
@@ -140,6 +140,19 @@ cp experiment.example.toml experiment.toml
 
 `prepare`, `run`, `features` і `report` не відкривають gold. Його читає лише `analyze` після
 завершення запусків.
+
+## Фічі тексту задачі
+
+`features` детерміновано виділяє з публічного `prompt` три булеві поля без доступу до gold:
+
+- `prompt_has_path` — є path-like значення з `/`;
+- `prompt_has_filename` — є ім'я файла з підтримуваним source/documentation розширенням;
+- `prompt_has_symbol` — є backtick/call, `snake_case` або `CamelCase` ідентифікатор.
+
+На етапі `analyze` додається `gold_locator_mentioned`. Воно дорівнює `true`, якщо знайдений у
+`prompt` шлях або filename відповідає gold-файлу, або явний symbol відповідає class/function/method,
+визначеному в Python gold-файлі. Ця фіча не потрапляє у `features/data.jsonl`, бо до `analyze`
+правильні файли залишаються закритими. Це описова фіча задачі, а не оцінка її складності.
 
 ## Режими роботи з документацією
 
