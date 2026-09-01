@@ -326,6 +326,24 @@ def _usage(events: bytes) -> dict[str, int | None]:
     return usage
 
 
+def _doc_first_valid(events: bytes, entry_path: str) -> bool:
+    for line in events.splitlines():
+        event = strict_json(line, "Codex event")
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        output = item.get("aggregated_output")
+        if not isinstance(command, str) or not isinstance(output, str):
+            return False
+        reads_file = any(tool in command for tool in ("cat ", "sed ", "head ", "tail ", "rg "))
+        has_sequence = any(separator in command for separator in (";", "&&", "||", "|"))
+        return bool(output) and entry_path in command and reads_file and not has_sequence
+    return False
+
+
 def _prompt(task: dict[str, Any]) -> str:
     return (
         "Locate the repository files relevant to the task. Work read-only. Return JSON with one "
@@ -475,16 +493,21 @@ def _execute(
                 except PipelineError:
                     terminal_reason = "invalid_output"
                 else:
-                    observation = {
-                        "schema_version": 1,
-                        **identity(plan),
-                        **cell,
-                        "status": "succeeded",
-                        "files": files,
-                        **observed_usage,
-                        "duration_ms": int((time.monotonic() - started) * 1000),
-                    }
-                    return Evidence(observation, events, stderr, final_output)
+                    if cell["condition"] == "DOC-FIRST" and not _doc_first_valid(
+                        events, task["documentation"]["entry_path"]
+                    ):
+                        terminal_reason = "condition_violation"
+                    else:
+                        observation = {
+                            "schema_version": 1,
+                            **identity(plan),
+                            **cell,
+                            "status": "succeeded",
+                            "files": files,
+                            **observed_usage,
+                            "duration_ms": int((time.monotonic() - started) * 1000),
+                        }
+                        return Evidence(observation, events, stderr, final_output)
     except OSError:
         terminal_reason = "launch_failed"
     observation = {
@@ -555,6 +578,10 @@ def run(config_path: Path, *, resume: bool) -> tuple[dict[str, str], Path]:
                 },
             )
             runs[cell["cell_id"]] = evidence.observation
+            if evidence.observation.get("terminal_reason") == "condition_violation":
+                raise ExecutionError(
+                    f"{cell['cell_id']}: DOC-FIRST did not read the configured entry first"
+                )
     terminals = [
         f"{cell['cell_id']}:{runs[cell['cell_id']]['terminal_reason']}"
         for cell in plan["cells"]
