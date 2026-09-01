@@ -156,6 +156,16 @@ uv run repository-localization report experiment.toml
 uv run repository-localization report experiment.toml --figures
 ```
 
+Після формування даних і статичних рисунків виконайте спільний notebook на тому самому конфігу.
+`nbconvert` та kernel підключаються лише для цього кроку й не входять до залежностей самого
+пайплайна:
+
+```bash
+EXPERIMENT_CONFIG=experiment.toml \
+  uv run --with nbconvert --with ipykernel \
+  jupyter nbconvert --to notebook --execute --inplace analysis/eda.ipynb
+```
+
 Після переривання дозволене лише явне продовження:
 
 ```bash
@@ -165,9 +175,10 @@ uv run repository-localization run experiment.toml --resume
 Автоматичних retry немає. Завершені та terminal клітинки не запускаються повторно. Claim без
 durable outcome також не повторюється, бо невідомо, чи provider уже виконав запит.
 
-Після завершення закомітьте результати окремо:
+Після завершення закомітьте результати, рисунки та виконаний notebook разом:
 
 ```bash
+git add analysis/eda.ipynb
 git add -f results/sympy-10-tasks/2026-09-01-v1
 git commit -m "experiment: record sympy 10-task results"
 ```
@@ -200,7 +211,8 @@ results/<experiment-id>/<experiment-version>/
 `cell_features.csv` має один рядок на клітинку. `task_features.csv` спочатку усереднює успішні
 profile/repeat спостереження в межах `task × condition`, а потім записує парні task-level різниці.
 
-Спільний notebook читає ці дві таблиці через той самий `experiment.toml`:
+Спільний notebook читає ці дві таблиці через той самий `experiment.toml`. Для інтерактивного
+перегляду вже виконаного notebook використайте:
 
 ```bash
 EXPERIMENT_CONFIG=experiment.toml jupyter lab analysis/eda.ipynb
