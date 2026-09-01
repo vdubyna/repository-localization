@@ -98,9 +98,10 @@ def _guidance(condition: str, entry_path: str) -> str | None:
         )
     if condition == "DOC-FIRST":
         return header + (
-            "Before searching, listing, or reading source-code paths or contents, read this "
-            "documentation entry. After that first documentation read, decide freely whether "
-            "to continue with documentation or inspect source code.\n"
+            f"Your first tool call must read only `{entry_path}` and return its contents. "
+            "Do not run pwd, ls, find, a path search, or any other tool first. After that "
+            "documentation read, decide freely whether to continue with documentation or inspect "
+            "source code.\n"
         )
     raise IntegrityError(f"unknown experiment condition: {condition}")
 

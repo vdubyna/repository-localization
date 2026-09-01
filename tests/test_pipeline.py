@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from repository_localization.analysis import _has_explicit_gold_locator, _prompt_features
+from repository_localization.execution import _doc_first_valid
 
 FIXTURE = Path(__file__).parent / "fixtures" / "experiment"
 
@@ -53,11 +54,11 @@ fi
 if [ -f AGENTS.md ]; then
   files='["pkg/service.py"]'
   event='{{"type":"item.completed",'\
-'"item":{{"type":"command_execution","command":"docs/index.md",'\
+'"item":{{"type":"command_execution","command":"cat docs/index.md",'\
 '"aggregated_output":"documentation\\n"}}}}'
   printf '%s\n' "$event"
   event='{{"type":"item.completed",'\
-'"item":{{"type":"command_execution","command":"docs/guide.md",'\
+'"item":{{"type":"command_execution","command":"cat docs/guide.md",'\
 '"aggregated_output":"service guide\\n"}}}}'
   printf '%s\n' "$event"
   event='{{"type":"item.completed",'\
@@ -163,6 +164,19 @@ def test_task_locator_features_are_explicit_and_gold_aware(tmp_path: Path) -> No
     )
 
 
+def test_doc_first_requires_the_documentation_read_as_the_first_tool_call() -> None:
+    documentation = (
+        b'{"type":"item.completed","item":{"type":"command_execution",'
+        b'"command":"cat docs/index.md","aggregated_output":"documentation\\n"}}\n'
+    )
+    navigation = (
+        b'{"type":"item.completed","item":{"type":"command_execution",'
+        b'"command":"pwd","aggregated_output":"/repository\\n"}}\n'
+    )
+    assert _doc_first_valid(documentation, "docs/index.md")
+    assert not _doc_first_valid(navigation + documentation, "docs/index.md")
+
+
 def test_eight_profiles_expand_the_frozen_plan(tmp_path: Path) -> None:
     fixture, config = setup(tmp_path)
     profiles = "".join(
@@ -255,7 +269,7 @@ def test_five_stage_versioned_pipeline_and_gold_boundary(tmp_path: Path) -> None
         {"model": "fixture-model", "reasoning_effort": "medium"},
     ]
     assert "You may consult" in plan["tasks"][0]["guidance"]["OPTIONAL"]
-    assert "Before searching" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
+    assert "first tool call" in plan["tasks"][0]["guidance"]["DOC-FIRST"]
     assert [row["mean_recall_at_5"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_recall_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
     assert [row["mean_ndcg_at_3"] for row in analysis["aggregates"]] == [0.0, 1.0, 1.0]
